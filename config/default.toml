@@ -1,0 +1,49 @@
+# Default LexiconWeaver Configuration
+# This file serves as a template. Copy to ~/.config/lexiconweaver/config.toml (Linux/Mac)
+# or %APPDATA%/lexiconweaver/config.toml (Windows) and customize.
+
+[ollama]
+# Ollama server URL
+url = "http://localhost:11434"
+# Model name to use for translation
+model = "llama2"
+# Request timeout in seconds
+timeout = 300
+# Maximum retries for failed requests
+max_retries = 3
+
+[database]
+# Path to the SQLite database file
+# If relative, will be resolved relative to the project directory
+# If not specified, defaults to ~/.local/share/lexiconweaver/lexiconweaver.db
+path = ""
+
+[logging]
+# Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL
+level = "INFO"
+# Enable JSON logging format (for production)
+json_logging = false
+# Log file path (leave empty for no file logging)
+log_file = ""
+
+[cache]
+# Enable translation caching
+enabled = true
+# Maximum cache size (number of entries)
+max_size = 10000
+
+[scout]
+# Minimum confidence score (0.0-1.0) for a term to be suggested
+min_confidence = 0.3
+# Maximum N-gram size for term extraction
+max_ngram_size = 4
+# Enable POS tagging filter (requires spacy model)
+use_pos_filter = true
+
+[weaver]
+# Number of paragraphs to process in parallel (0 = sequential)
+parallel_paragraphs = 0
+# Enable streaming responses from LLM
+streaming = true
+# Maximum context window size (in tokens, approximate)
+max_context_tokens = 4000
