@@ -3,7 +3,7 @@
 from pathlib import Path
 from textual.containers import Container, Horizontal, ScrollableContainer, Vertical
 from textual.screen import Screen
-from textual.widgets import Footer, Header, Static
+from textual.widgets import Footer, Header, Input, Static
 
 from lexiconweaver.config import Config
 from lexiconweaver.database.models import GlossaryTerm, Project
@@ -60,6 +60,11 @@ class MainScreen(Screen):
         min-height: 5;
     }
 
+    #candidate_search {
+        margin: 1;
+        width: 1fr;
+    }
+
     #status_bar {
         height: 1;
         dock: bottom;
@@ -98,6 +103,10 @@ class MainScreen(Screen):
                     yield TextPanel(self._text, id="text_panel")
             with Vertical(id="candidate_container"):
                 yield Static("Candidate Terms", classes="section_title")
+                yield Input(
+                    placeholder="Search candidates...",
+                    id="candidate_search",
+                )
                 yield CandidateList(id="candidate_list")
         yield Static("Ready", id="status_bar")
         yield Footer()
@@ -297,6 +306,13 @@ class MainScreen(Screen):
         candidate = message.candidate
         self._safe_update_status(f"Skipped: {candidate.term}")
         logger.debug("Term skipped", term=candidate.term)
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        """Handle search input changes."""
+        if event.input.id == "candidate_search":
+            search_query = event.value
+            candidate_list = self.query_one("#candidate_list", CandidateList)
+            candidate_list.filter_candidates(search_query)
 
     def on_candidate_list_highlighted(self, message: CandidateList.Highlighted) -> None:
         """Handle candidate click - navigate to term location in text."""

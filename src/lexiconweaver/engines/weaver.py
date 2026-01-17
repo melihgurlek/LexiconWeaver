@@ -30,6 +30,46 @@ class Weaver(BaseEngine):
         self.max_retries = config.ollama.max_retries
         self.cache_enabled = config.cache.enabled
 
+    def _prepare_messages(
+            self, text: str, mini_glossary: dict[str, str], context: str = ""
+        ) -> list[dict]:
+            """Construct the chat messages for Ollama."""
+            
+            # 1. Prepare Glossary Block
+            glossary_block = "No specific terms."
+            if mini_glossary:
+                # Use strict mapping format
+                glossary_lines = [f"- {src} -> {tgt}" for src, tgt in mini_glossary.items()]
+                glossary_block = "\n".join(glossary_lines)
+
+            # 2. SYSTEM PROMPT (The "Brain") - Strict Rules
+            system_content = """You are a specialized translation engine for Wuxia/Xianxia fantasy novels.
+    Target Language: Turkish.
+
+    CRITICAL RULES:
+    1.  **Output ONLY the translation.** Do not include "Here is the translation", notes, explanations, or quotes.
+    2.  **Strict Glossary Adherence:** You MUST use the provided glossary terms exactly.
+    3.  **Genre Tone:** Use dramatic, epic, and culturally appropriate Turkish terminology.
+        * "Sect" -> "Tarikat" or "Mezhep"
+        * "Cultivation" -> "Efsun" or "Gelişim"
+    4.  **No Repetition:** Do not translate the "Context History". Only translate the "Current Chunk"."""
+
+            user_content = f"""
+    ### GLOSSARY (MANDATORY):
+    {glossary_block}
+
+    ### CONTEXT (PREVIOUSLY TRANSLATED - DO NOT TRANSLATE):
+    {context if context else "No previous context."}
+
+    ### CURRENT CHUNK (TRANSLATE THIS):
+    {text}
+    """
+
+            return [
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": user_content},
+            ]
+
     async def translate_paragraph(
         self, paragraph: str, use_cache: bool = True
     ) -> str:
@@ -44,11 +84,11 @@ class Weaver(BaseEngine):
         # Build mini-glossary for this paragraph
         mini_glossary = self._build_mini_glossary(paragraph)
 
-        # Build prompt
-        prompt = self._build_prompt(paragraph, mini_glossary)
+        # Build messages
+        messages = self._prepare_messages(paragraph, mini_glossary)
 
         # Call Ollama
-        translation = await self._call_ollama(prompt)
+        translation = await self._call_ollama(messages)
 
         # Verify translation
         self._verify_translation(paragraph, translation, mini_glossary)
@@ -66,12 +106,12 @@ class Weaver(BaseEngine):
         # Build mini-glossary
         mini_glossary = self._build_mini_glossary(paragraph)
 
-        # Build prompt
-        prompt = self._build_prompt(paragraph, mini_glossary)
+        # Build messages
+        messages = self._prepare_messages(paragraph, mini_glossary)
 
         # Stream from Ollama
         full_translation = ""
-        async for chunk in self._call_ollama_streaming(prompt):
+        async for chunk in self._call_ollama_streaming(messages):
             full_translation += chunk
             yield chunk
 
@@ -88,28 +128,27 @@ class Weaver(BaseEngine):
         """Translate a batch with streaming response, optionally including context.
         
         Args:
-            batch: The text batch to translate
+            batch: The text batch to translate (ONLY new text, not merged with context)
             context: Optional context from previous batch (e.g., last 2 sentences)
             
         Yields:
             Translation chunks as they arrive from the LLM
         """
-        text_to_translate = f"{context}\n\n{batch}" if context else batch
+        # The 'batch' variable contains strictly the NEW text we want to translate
+        text_to_translate = batch
         
+        # Build glossary based ONLY on the new text
         mini_glossary = self._build_mini_glossary(text_to_translate)
         
-        prompt = self._build_prompt_with_context(text_to_translate, mini_glossary, context)
+        # Pass context separately (not merged)
+        messages = self._prepare_messages(text_to_translate, mini_glossary, context)
         
         full_translation = ""
-        async for chunk in self._call_ollama_streaming(prompt):
+        async for chunk in self._call_ollama_streaming(messages):
             full_translation += chunk
             yield chunk
         
-        # Extract only the new translation (remove context translation if present)
-        # This is a simple heuristic: if context was provided, the translation
-        # might include it. We'll return the full translation and let the caller
-        # handle context removal if needed.
-        
+        # Verify translation against only the new batch (not context)
         self._verify_translation(text_to_translate, full_translation, mini_glossary)
         
         if self.cache_enabled:
@@ -152,10 +191,14 @@ class Weaver(BaseEngine):
             GlossaryTerm.project == self.project
         )
 
-        # Use FlashText for efficient matching
+        # Use FlashText for efficient matching with direct mapping
+        # FIX: Ensure text is clean for matching
+        # FlashText is great, and we can use its direct mapping feature
         keyword_processor = KeywordProcessor(case_sensitive=False)
-        term_map: dict[str, str] = {}
-
+        # Build our own mapping dict for case-insensitive lookup
+        # Maps lowercase source terms to their target translations
+        term_mapping: dict[str, str] = {}
+        
         for term in glossary_terms:
             if term.is_regex:
                 # For regex terms, we'd need pattern matching
@@ -165,81 +208,41 @@ class Weaver(BaseEngine):
             source_term = term.source_term
             target_term = term.target_term
 
-            # Add to keyword processor
-            keyword_processor.add_keyword(source_term)
-            term_map[source_term.lower()] = target_term
+            # FIX: Add keyword with direct mapping to target term
+            # This helps FlashText map directly without needing a separate lookup
+            # FlashText's add_keyword(source_term, target_term) creates the mapping
+            keyword_processor.add_keyword(source_term, target_term)
+            
+            # Also store in our mapping dict for case-insensitive lookup
+            term_mapping[source_term.lower()] = target_term
 
-        # Find all terms in the text
-        found_terms = keyword_processor.extract_keywords(text.lower())
-        mini_glossary = {
-            term: term_map[term.lower()] for term in found_terms if term.lower() in term_map
-        }
+        # Extract keywords that appear in the text
+        # extract_keywords returns the keywords as they appear in the text (preserving case)
+        found_terms = keyword_processor.extract_keywords(text)
+        
+        # Build mini-glossary with only the terms that were found
+        # Use lowercase lookup to handle case variations
+        mini_glossary = {}
+        for found_term in found_terms:
+            found_term_lower = found_term.lower()
+            if found_term_lower in term_mapping:
+                # Use the original found_term as key (preserving case from text)
+                # but map to the target translation
+                mini_glossary[found_term] = term_mapping[found_term_lower]
 
         return mini_glossary
 
-    def _build_prompt(self, paragraph: str, mini_glossary: dict[str, str]) -> str:
-        """Build the translation prompt for Ollama."""
-        glossary_block = ""
-        if mini_glossary:
-            glossary_lines = [
-                f"- {source}: {target}" for source, target in mini_glossary.items()
-            ]
-            glossary_block = "Glossary (use these exact translations):\n" + "\n".join(glossary_lines) + "\n\n"
-
-        prompt = f"""You are a professional translator specializing in fantasy and web novels.
-
-Your task is to translate the following text into Turkish while maintaining consistency with specialized terminology.
-
-{glossary_block}Translate the following paragraph. You must use the glossary terms exactly as provided. Maintain the original meaning, tone, and style.
-
-Paragraph to translate:
-{paragraph}
-
-Translation:"""
-
-        return prompt
-
-    def _build_prompt_with_context(
-        self, text: str, mini_glossary: dict[str, str], context: str = ""
-    ) -> str:
-        """Build the translation prompt with context awareness."""
-        glossary_block = ""
-        if mini_glossary:
-            glossary_lines = [
-                f"- {source}: {target}" for source, target in mini_glossary.items()
-            ]
-            glossary_block = "Glossary (use these exact translations):\n" + "\n".join(glossary_lines) + "\n\n"
-
-        context_note = ""
-        if context:
-            context_note = f"""Note: The text below includes context from the previous section for coherence. Translate the entire text, maintaining continuity with the previous translation.
-
-Context (already translated, for reference only):
-{context}
-
-"""
-
-        prompt = f"""You are a professional translator specializing in fantasy and web novels.
-
-Your task is to translate the following text into Turkish while maintaining consistency with specialized terminology.
-
-{glossary_block}{context_note}Translate the following text. You must use the glossary terms exactly as provided. Maintain the original meaning, tone, and style. Ensure the translation flows naturally with the context provided above.
-
-Text to translate:
-{text}
-
-Translation:"""
-
-        return prompt
-
-    async def _call_ollama(self, prompt: str) -> str:
+    async def _call_ollama(self, messages: list[dict]) -> str:
         """Call Ollama API for translation with retry logic."""
-        url = f"{self.ollama_url}/api/generate"
+        url = f"{self.ollama_url}/api/chat"
 
         payload = {
             "model": self.model,
-            "prompt": prompt,
+            "messages": messages,
             "stream": False,
+            "options": {
+                "temperature": 0.6
+            }
         }
 
         for attempt in range(self.max_retries + 1):
@@ -253,7 +256,7 @@ Translation:"""
                         )
 
                     result = response.json()
-                    return result.get("response", "").strip()
+                    return result.get("message", {}).get("content", "").strip()
 
             except httpx.TimeoutException as e:
                 if attempt < self.max_retries:
@@ -280,15 +283,16 @@ Translation:"""
         raise TranslationError("Failed to get translation after retries")
 
     async def _call_ollama_streaming(
-        self, prompt: str
+        self, messages: list[dict]
     ) -> AsyncIterator[str]:
         """Call Ollama API with streaming response."""
-        url = f"{self.ollama_url}/api/generate"
+        url = f"{self.ollama_url}/api/chat"
 
         payload = {
             "model": self.model,
-            "prompt": prompt,
+            "messages": messages,
             "stream": True,
+            "options": {"temperature": 0.6}
         }
 
         try:
@@ -306,8 +310,9 @@ Translation:"""
 
                         try:
                             data = json.loads(line)
-                            if "response" in data:
-                                yield data["response"]
+                            content = data.get("message", {}).get("content", "")
+                            if content:
+                                yield content
                         except json.JSONDecodeError:
                             continue
 
