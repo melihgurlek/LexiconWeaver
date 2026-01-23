@@ -6,6 +6,7 @@ from typing import AsyncIterator
 
 import httpx
 from flashtext import KeywordProcessor
+from peewee import IntegrityError
 
 from lexiconweaver.config import Config
 from lexiconweaver.database.models import GlossaryTerm, Project, TranslationCache
@@ -31,44 +32,46 @@ class Weaver(BaseEngine):
         self.cache_enabled = config.cache.enabled
 
     def _prepare_messages(
-            self, text: str, mini_glossary: dict[str, str], context: str = ""
-        ) -> list[dict]:
-            """Construct the chat messages for Ollama."""
-            
-            # 1. Prepare Glossary Block
-            glossary_block = "No specific terms."
-            if mini_glossary:
-                # Use strict mapping format
-                glossary_lines = [f"- {src} -> {tgt}" for src, tgt in mini_glossary.items()]
-                glossary_block = "\n".join(glossary_lines)
+        self, text: str, mini_glossary: dict[str, str], context: str = ""
+    ) -> list[dict[str, str]]:
+        """Construct the chat messages for Ollama."""
 
-            # 2. SYSTEM PROMPT (The "Brain") - Strict Rules
-            system_content = """You are a specialized translation engine for Wuxia/Xianxia fantasy novels.
-    Target Language: Turkish.
-
-    CRITICAL RULES:
-    1.  **Output ONLY the translation.** Do not include "Here is the translation", notes, explanations, or quotes.
-    2.  **Strict Glossary Adherence:** You MUST use the provided glossary terms exactly.
-    3.  **Genre Tone:** Use dramatic, epic, and culturally appropriate Turkish terminology.
-        * "Sect" -> "Tarikat" or "Mezhep"
-        * "Cultivation" -> "Efsun" or "Gelişim"
-    4.  **No Repetition:** Do not translate the "Context History". Only translate the "Current Chunk"."""
-
-            user_content = f"""
-    ### GLOSSARY (MANDATORY):
-    {glossary_block}
-
-    ### CONTEXT (PREVIOUSLY TRANSLATED - DO NOT TRANSLATE):
-    {context if context else "No previous context."}
-
-    ### CURRENT CHUNK (TRANSLATE THIS):
-    {text}
-    """
-
-            return [
-                {"role": "system", "content": system_content},
-                {"role": "user", "content": user_content},
+        # 1. Prepare glossary block (strict mapping format).
+        glossary_block = "No specific terms."
+        if mini_glossary:
+            glossary_lines = [
+                f"- {src} -> {tgt}" for src, tgt in mini_glossary.items()
             ]
+            glossary_block = "\n".join(glossary_lines)
+
+        # 2. System prompt (strict rules).
+        system_content = (
+            "You are a specialized translation engine for Wuxia/Xianxia fantasy novels.\n"
+            "Target Language: Turkish.\n\n"
+            "CRITICAL RULES:\n"
+            '1. Output ONLY the translation. Do not include "Here is the translation", '
+            "notes, explanations, or quotes.\n"
+            "2. Strict Glossary Adherence: You MUST use the provided glossary terms exactly.\n"
+            "3. Genre Tone: Use dramatic, epic, and culturally appropriate Turkish terminology.\n"
+            '   - "Sect" -> "Tarikat" or "Mezhep"\n'
+            '   - "Cultivation" -> "Efsun" or "Gelişim"\n'
+            '4. No Repetition: Do not translate the "CONTEXT". Only translate the "CURRENT CHUNK".\n'
+
+        )
+
+        user_content = (
+            "### GLOSSARY (MANDATORY):\n"
+            f"{glossary_block}\n\n"
+            "### CONTEXT (PREVIOUSLY TRANSLATED - DO NOT TRANSLATE):\n"
+            f'{context if context else "No previous context."}\n\n'
+            "### CURRENT CHUNK (TRANSLATE THIS):\n"
+            f"{text}\n"
+        )
+
+        return [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": user_content},
+        ]
 
     async def translate_paragraph(
         self, paragraph: str, use_cache: bool = True
@@ -191,13 +194,11 @@ class Weaver(BaseEngine):
             GlossaryTerm.project == self.project
         )
 
-        # Use FlashText for efficient matching with direct mapping
-        # FIX: Ensure text is clean for matching
-        # FlashText is great, and we can use its direct mapping feature
+        # Use FlashText for efficient matching
+        # Note: We want to extract SOURCE terms that appear in the text, then map
+        # them to their TARGET terms via our lookup dict.
         keyword_processor = KeywordProcessor(case_sensitive=False)
-        # Build our own mapping dict for case-insensitive lookup
-        # Maps lowercase source terms to their target translations
-        term_mapping: dict[str, str] = {}
+        term_map: dict[str, str] = {}
         
         for term in glossary_terms:
             if term.is_regex:
@@ -208,27 +209,22 @@ class Weaver(BaseEngine):
             source_term = term.source_term
             target_term = term.target_term
 
-            # FIX: Add keyword with direct mapping to target term
-            # This helps FlashText map directly without needing a separate lookup
-            # FlashText's add_keyword(source_term, target_term) creates the mapping
-            keyword_processor.add_keyword(source_term, target_term)
-            
-            # Also store in our mapping dict for case-insensitive lookup
-            term_mapping[source_term.lower()] = target_term
+            # Add to keyword processor (case-insensitive matching)
+            keyword_processor.add_keyword(source_term)
+            term_map[source_term.lower()] = target_term
 
-        # Extract keywords that appear in the text
-        # extract_keywords returns the keywords as they appear in the text (preserving case)
-        found_terms = keyword_processor.extract_keywords(text)
+        # Extract keywords that appear in the text.
+        # Small hygiene: normalize common whitespace oddities for matching only.
+        match_text = text.replace("\u00a0", " ")
+        found_terms = keyword_processor.extract_keywords(match_text)
         
-        # Build mini-glossary with only the terms that were found
-        # Use lowercase lookup to handle case variations
-        mini_glossary = {}
-        for found_term in found_terms:
-            found_term_lower = found_term.lower()
-            if found_term_lower in term_mapping:
-                # Use the original found_term as key (preserving case from text)
-                # but map to the target translation
-                mini_glossary[found_term] = term_mapping[found_term_lower]
+        # Build mini-glossary with only the terms that were found.
+        # Use dict.fromkeys to preserve order while de-duping.
+        mini_glossary: dict[str, str] = {}
+        for found_term in dict.fromkeys(found_terms):
+            target = term_map.get(found_term.lower())
+            if target:
+                mini_glossary[found_term] = target
 
         return mini_glossary
 
@@ -359,11 +355,25 @@ class Weaver(BaseEngine):
     def _get_from_cache(self, paragraph: str) -> str | None:
         """Get translation from cache if available."""
         try:
-            cache_hash = generate_hash(paragraph)
+            # Include project id in the hash to avoid cross-project collisions.
+            # (The DB schema currently uses `hash` as a global primary key.)
+            project_id = getattr(self.project, "id", None)
+            cache_hash = (
+                generate_hash(f"{project_id}:{paragraph}") if project_id is not None else generate_hash(paragraph)
+            )
+
             cached = TranslationCache.get_or_none(
                 TranslationCache.hash == cache_hash,
                 TranslationCache.project == self.project,
             )
+
+            # Backward compatibility: older cache entries used hash(paragraph) only.
+            if cached is None:
+                legacy_hash = generate_hash(paragraph)
+                cached = TranslationCache.get_or_none(
+                    TranslationCache.hash == legacy_hash,
+                    TranslationCache.project == self.project,
+                )
             return cached.translation if cached else None
         except Exception as e:
             logger.warning("Failed to get from cache", error=str(e))
@@ -372,12 +382,26 @@ class Weaver(BaseEngine):
     def _store_in_cache(self, paragraph: str, translation: str) -> None:
         """Store translation in cache."""
         try:
-            cache_hash = generate_hash(paragraph)
-            TranslationCache.create(
-                hash=cache_hash,
-                project=self.project,
-                translation=translation,
+            # Include project id in the hash to avoid cross-project collisions.
+            project_id = getattr(self.project, "id", None)
+            cache_hash = (
+                generate_hash(f"{project_id}:{paragraph}") if project_id is not None else generate_hash(paragraph)
             )
+
+            try:
+                TranslationCache.create(
+                    hash=cache_hash,
+                    project=self.project,
+                    translation=translation,
+                )
+            except IntegrityError:
+                # Cache entry already exists (e.g., same batch translated twice).
+                # Update it instead of warning.
+                (
+                    TranslationCache.update(translation=translation, project=self.project)
+                    .where(TranslationCache.hash == cache_hash)
+                    .execute()
+                )
         except Exception as e:
             logger.warning("Failed to store in cache", error=str(e))
             # Don't raise - caching is not critical

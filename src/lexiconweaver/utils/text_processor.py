@@ -60,13 +60,13 @@ def batch_paragraphs_smart(
     """Batch paragraphs intelligently without exceeding character limit.
     
     Batches paragraphs together until adding another would exceed max_chars.
-    For each batch after the first, prepends the last N sentences from the
-    previous batch to maintain context.
+    Context is handled separately at the translation/prompt layer (to avoid
+    duplicating context inside the batch itself).
     
     Args:
         text: The text to batch
         max_chars: Maximum characters per batch (default: 2000)
-        context_sentences: Number of sentences to keep as context (default: 2)
+        context_sentences: Deprecated (kept for compatibility; ignored)
         
     Returns:
         List of batched text chunks
@@ -78,7 +78,6 @@ def batch_paragraphs_smart(
     batches: list[str] = []
     current_batch: list[str] = []
     current_length = 0
-    previous_batch_sentences: list[str] = []
     
     for paragraph in paragraphs:
         para_length = len(paragraph)
@@ -87,55 +86,27 @@ def batch_paragraphs_smart(
         # but we'll add it as its own batch
         if para_length > max_chars:
             if current_batch:
-                batch_text = "\n\n".join(current_batch)
-                batches.append(batch_text)
-                previous_batch_sentences = _extract_last_sentences(batch_text, context_sentences)
+                batches.append("\n\n".join(current_batch))
                 current_batch = []
                 current_length = 0
             
             # Add the oversized paragraph as its own batch
             batches.append(paragraph)
-            previous_batch_sentences = _extract_last_sentences(paragraph, context_sentences)
             continue
         
         # Check if adding this paragraph would exceed the limit
-        # Account for context if this isn't the first batch
-        context_length = len("\n\n".join(previous_batch_sentences)) if previous_batch_sentences else 0
-        context_separator = "\n\n" if previous_batch_sentences else ""
-        potential_length = current_length + len(context_separator) + context_length + para_length
-        
+        separator_len = 2 if current_batch else 0  # "\n\n"
+        potential_length = current_length + separator_len + para_length
+
         if potential_length > max_chars and current_batch:
-            batch_text = "\n\n".join(current_batch)
-            batches.append(batch_text)
-            previous_batch_sentences = _extract_last_sentences(batch_text, context_sentences)
-            current_batch = previous_batch_sentences.copy() if previous_batch_sentences else []
-            current_length = context_length + (len(context_separator) if previous_batch_sentences else 0)
+            batches.append("\n\n".join(current_batch))
+            current_batch = []
+            current_length = 0
         
         current_batch.append(paragraph)
-        current_length += para_length
-        if len(current_batch) > 1:  # Account for separators
-            current_length += 2  # "\n\n"
+        current_length += para_length + (2 if len(current_batch) > 1 else 0)
     
     if current_batch:
-        batch_text = "\n\n".join(current_batch)
-        batches.append(batch_text)
+        batches.append("\n\n".join(current_batch))
     
     return batches if batches else [text]
-
-
-def _extract_last_sentences(text: str, count: int) -> list[str]:
-    """Extract the last N sentences from text.
-    
-    Args:
-        text: The text to extract sentences from
-        count: Number of sentences to extract
-        
-    Returns:
-        List of sentence strings
-    """
-    sentences = split_into_sentences(text)
-    if not sentences:
-        return []
-    
-    # Return last N sentences, or all if there are fewer than N
-    return sentences[-count:] if len(sentences) >= count else sentences
