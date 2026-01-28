@@ -194,16 +194,12 @@ class Weaver(BaseEngine):
             GlossaryTerm.project == self.project
         )
 
-        # Use FlashText for efficient matching
-        # Note: We want to extract SOURCE terms that appear in the text, then map
-        # them to their TARGET terms via our lookup dict.
+
         keyword_processor = KeywordProcessor(case_sensitive=False)
         term_map: dict[str, str] = {}
         
         for term in glossary_terms:
             if term.is_regex:
-                # For regex terms, we'd need pattern matching
-                # For now, skip regex terms in mini-glossary (they're handled in verification)
                 continue
 
             source_term = term.source_term
@@ -213,13 +209,9 @@ class Weaver(BaseEngine):
             keyword_processor.add_keyword(source_term)
             term_map[source_term.lower()] = target_term
 
-        # Extract keywords that appear in the text.
-        # Small hygiene: normalize common whitespace oddities for matching only.
         match_text = text.replace("\u00a0", " ")
         found_terms = keyword_processor.extract_keywords(match_text)
         
-        # Build mini-glossary with only the terms that were found.
-        # Use dict.fromkeys to preserve order while de-duping.
         mini_glossary: dict[str, str] = {}
         for found_term in dict.fromkeys(found_terms):
             target = term_map.get(found_term.lower())
