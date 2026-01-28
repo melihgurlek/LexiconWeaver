@@ -46,21 +46,24 @@ class Weaver(BaseEngine):
 
         # 2. System prompt (strict rules).
         system_content = (
-            "You are a specialized translation engine for Wuxia/Xianxia fantasy novels.\n"
+           "You are a specialized translation engine for Wuxia/Xianxia fantasy novels.\n"
             "Target Language: Turkish.\n\n"
             "CRITICAL RULES:\n"
-            '1. Output ONLY the translation. Do not include "Here is the translation", '
-            "notes, explanations, or quotes.\n"
-            "2. Strict Glossary Adherence: You MUST use the provided glossary terms exactly.\n"
-            "3. Genre Tone: Use dramatic, epic, and culturally appropriate Turkish terminology.\n"
-            '   - "Sect" -> "Tarikat" or "Mezhep"\n'
-            '   - "Cultivation" -> "Efsun" or "Gelişim"\n'
-            '4. No Repetition: Do not translate the "CONTEXT". Only translate the "CURRENT CHUNK".\n'
+            "1. **Glossary as Root:** The glossary provides the ROOT form (Kök) of the word.\n"
+            "   - You MUST use this root for the specific term.\n"
+            "   - You MUST apply correct Turkish suffixes (sondan ekleme) to this root to fit the sentence grammar.\n"
+            "   - You MUST handle consonant mutation (ünsüz yumuşaması) correctly (e.g., Böcek -> Böceği).\n"
+            "2. **Protect Proper Nouns:** Do NOT translate or modify Names of People or Places unless they are explicitly in the glossary.\n"
+            "   - 'Fang Yuan' -> 'Fang Yuan' (Do not change to 'Fang Kaynak').\n"
+            "   - 'Qing Mao Mountain' -> 'Qing Mao Dağı' (Only translate the generic part 'Mountain').\n"
+            "3. **Output ONLY the translation.** No notes, headers, or explanations.\n"
+            "4. **Genre Tone:** Use 'Klan' for Clan, 'Tarikat' for Sect.\n"
+            "5. **No Repetition:** Do not translate the 'CONTEXT' section.\n"
 
         )
 
         user_content = (
-            "### GLOSSARY (MANDATORY):\n"
+            "### GLOSSARY (Use as Roots):\n"
             f"{glossary_block}\n\n"
             "### CONTEXT (PREVIOUSLY TRANSLATED - DO NOT TRANSLATE):\n"
             f'{context if context else "No previous context."}\n\n'
@@ -77,26 +80,20 @@ class Weaver(BaseEngine):
         self, paragraph: str, use_cache: bool = True
     ) -> str:
         """Translate a single paragraph."""
-        # Check cache first
         if use_cache and self.cache_enabled:
             cached = self._get_from_cache(paragraph)
             if cached is not None:
                 logger.debug("Cache hit for paragraph", hash=generate_hash(paragraph)[:8])
                 return cached
 
-        # Build mini-glossary for this paragraph
         mini_glossary = self._build_mini_glossary(paragraph)
 
-        # Build messages
         messages = self._prepare_messages(paragraph, mini_glossary)
 
-        # Call Ollama
         translation = await self._call_ollama(messages)
 
-        # Verify translation
         self._verify_translation(paragraph, translation, mini_glossary)
 
-        # Store in cache
         if use_cache and self.cache_enabled:
             self._store_in_cache(paragraph, translation)
 
@@ -106,22 +103,17 @@ class Weaver(BaseEngine):
         self, paragraph: str
     ) -> AsyncIterator[str]:
         """Translate a paragraph with streaming response."""
-        # Build mini-glossary
         mini_glossary = self._build_mini_glossary(paragraph)
 
-        # Build messages
         messages = self._prepare_messages(paragraph, mini_glossary)
 
-        # Stream from Ollama
         full_translation = ""
         async for chunk in self._call_ollama_streaming(messages):
             full_translation += chunk
             yield chunk
 
-        # Verify after streaming completes
         self._verify_translation(paragraph, full_translation, mini_glossary)
 
-        # Store in cache
         if self.cache_enabled:
             self._store_in_cache(paragraph, full_translation)
 
@@ -137,13 +129,10 @@ class Weaver(BaseEngine):
         Yields:
             Translation chunks as they arrive from the LLM
         """
-        # The 'batch' variable contains strictly the NEW text we want to translate
         text_to_translate = batch
         
-        # Build glossary based ONLY on the new text
         mini_glossary = self._build_mini_glossary(text_to_translate)
         
-        # Pass context separately (not merged)
         messages = self._prepare_messages(text_to_translate, mini_glossary, context)
         
         full_translation = ""
@@ -151,7 +140,6 @@ class Weaver(BaseEngine):
             full_translation += chunk
             yield chunk
         
-        # Verify translation against only the new batch (not context)
         self._verify_translation(text_to_translate, full_translation, mini_glossary)
         
         if self.cache_enabled:
@@ -189,7 +177,6 @@ class Weaver(BaseEngine):
 
     def _build_mini_glossary(self, text: str) -> dict[str, str]:
         """Build a mini-glossary containing only terms that appear in the text."""
-        # Get all glossary terms for this project
         glossary_terms = GlossaryTerm.select().where(
             GlossaryTerm.project == self.project
         )
@@ -205,7 +192,6 @@ class Weaver(BaseEngine):
             source_term = term.source_term
             target_term = term.target_term
 
-            # Add to keyword processor (case-insensitive matching)
             keyword_processor.add_keyword(source_term)
             term_map[source_term.lower()] = target_term
 
@@ -248,7 +234,7 @@ class Weaver(BaseEngine):
 
             except httpx.TimeoutException as e:
                 if attempt < self.max_retries:
-                    wait_time = 2 ** attempt  # Exponential backoff
+                    wait_time = 2 ** attempt
                     logger.warning(
                         "Ollama timeout, retrying",
                         attempt=attempt + 1,
@@ -317,8 +303,6 @@ class Weaver(BaseEngine):
         self, source: str, translation: str, mini_glossary: dict[str, str]
     ) -> None:
         """Verify that all glossary terms in source appear in translation."""
-        # This is a basic check - in a real implementation, you might want
-        # more sophisticated verification (fuzzy matching, etc.)
         missing_terms: list[str] = []
 
         source_lower = source.lower()
@@ -328,13 +312,20 @@ class Weaver(BaseEngine):
             source_term_lower = source_term.lower()
             target_term_lower = target_term.lower()
 
-            # Check if source term appears in source text
             if source_term_lower not in source_lower:
                 continue
 
-            # Check if target term appears in translation
-            if target_term_lower not in translation_lower:
-                missing_terms.append(source_term)
+            if target_term_lower in translation_lower:
+                continue
+
+            if len(target_term_lower) >= 4:
+                root_len = int(len(target_term_lower) * 0.7)
+                root_guess = target_term_lower[:root_len]
+                
+                if root_guess in translation_lower:
+                    continue
+
+            missing_terms.append(source_term)
 
         if missing_terms:
             logger.warning(
@@ -342,13 +333,10 @@ class Weaver(BaseEngine):
                 missing_terms=missing_terms,
                 source_hash=generate_hash(source)[:8],
             )
-            # Don't raise error, just log - the UI will handle marking as [UNSTABLE]
 
     def _get_from_cache(self, paragraph: str) -> str | None:
         """Get translation from cache if available."""
         try:
-            # Include project id in the hash to avoid cross-project collisions.
-            # (The DB schema currently uses `hash` as a global primary key.)
             project_id = getattr(self.project, "id", None)
             cache_hash = (
                 generate_hash(f"{project_id}:{paragraph}") if project_id is not None else generate_hash(paragraph)
@@ -359,7 +347,6 @@ class Weaver(BaseEngine):
                 TranslationCache.project == self.project,
             )
 
-            # Backward compatibility: older cache entries used hash(paragraph) only.
             if cached is None:
                 legacy_hash = generate_hash(paragraph)
                 cached = TranslationCache.get_or_none(
@@ -374,7 +361,6 @@ class Weaver(BaseEngine):
     def _store_in_cache(self, paragraph: str, translation: str) -> None:
         """Store translation in cache."""
         try:
-            # Include project id in the hash to avoid cross-project collisions.
             project_id = getattr(self.project, "id", None)
             cache_hash = (
                 generate_hash(f"{project_id}:{paragraph}") if project_id is not None else generate_hash(paragraph)
@@ -387,8 +373,6 @@ class Weaver(BaseEngine):
                     translation=translation,
                 )
             except IntegrityError:
-                # Cache entry already exists (e.g., same batch translated twice).
-                # Update it instead of warning.
                 (
                     TranslationCache.update(translation=translation, project=self.project)
                     .where(TranslationCache.hash == cache_hash)
@@ -396,7 +380,6 @@ class Weaver(BaseEngine):
                 )
         except Exception as e:
             logger.warning("Failed to store in cache", error=str(e))
-            # Don't raise - caching is not critical
 
     def process(self, text: str) -> str:
         """Process text synchronously (wrapper for async method)."""
