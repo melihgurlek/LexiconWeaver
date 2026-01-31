@@ -1,40 +1,41 @@
 """Weaver engine for LLM-based translation with glossary enforcement."""
 
 import asyncio
-import json
 from typing import AsyncIterator
 
-import httpx
 from flashtext import KeywordProcessor
 from peewee import IntegrityError
 
 from lexiconweaver.config import Config
 from lexiconweaver.database.models import GlossaryTerm, Project, TranslationCache
 from lexiconweaver.engines.base import BaseEngine
-from lexiconweaver.exceptions import TranslationError, WeaverError
+from lexiconweaver.exceptions import ProviderError, TranslationError
 from lexiconweaver.logging_config import get_logger
+from lexiconweaver.providers import LLMProviderManager
 from lexiconweaver.utils.text_processor import extract_paragraphs, generate_hash
 
 logger = get_logger(__name__)
 
 
 class Weaver(BaseEngine):
-    """Generation engine that interfaces with Ollama for translation."""
+    """Generation engine that interfaces with LLM providers for translation."""
 
     def __init__(self, config: Config, project: Project) -> None:
-        """Initialize the Weaver engine."""
+        """Initialize the Weaver engine.
+        
+        Args:
+            config: Application configuration.
+            project: The project context for glossary terms.
+        """
         self.config = config
         self.project = project
-        self.ollama_url = config.ollama.url
-        self.model = config.ollama.model
-        self.timeout = config.ollama.timeout
-        self.max_retries = config.ollama.max_retries
+        self.provider_manager = LLMProviderManager(config)
         self.cache_enabled = config.cache.enabled
 
     def _prepare_messages(
         self, text: str, mini_glossary: dict[str, str], context: str = ""
     ) -> list[dict[str, str]]:
-        """Construct the chat messages for Ollama."""
+        """Construct the chat messages for the LLM."""
 
         # 1. Prepare glossary block (strict mapping format).
         glossary_block = "No specific terms."
@@ -46,7 +47,7 @@ class Weaver(BaseEngine):
 
         # 2. System prompt (strict rules).
         system_content = (
-           "You are a specialized translation engine for Wuxia/Xianxia fantasy novels.\n"
+            "You are a specialized translation engine for Wuxia/Xianxia fantasy novels.\n"
             "Target Language: Turkish.\n\n"
             "CRITICAL RULES:\n"
             "1. **Glossary as Root:** The glossary provides the ROOT form (Kök) of the word.\n"
@@ -59,7 +60,6 @@ class Weaver(BaseEngine):
             "3. **Output ONLY the translation.** No notes, headers, or explanations.\n"
             "4. **Genre Tone:** Use 'Klan' for Clan, 'Tarikat' for Sect.\n"
             "5. **No Repetition:** Do not translate the 'CONTEXT' section.\n"
-
         )
 
         user_content = (
@@ -90,7 +90,13 @@ class Weaver(BaseEngine):
 
         messages = self._prepare_messages(paragraph, mini_glossary)
 
-        translation = await self._call_ollama(messages)
+        try:
+            translation = await self.provider_manager.generate(messages)
+        except ProviderError as e:
+            raise TranslationError(
+                f"Translation failed: {e.message}",
+                details=f"Provider: {e.provider}",
+            ) from e
 
         self._verify_translation(paragraph, translation, mini_glossary)
 
@@ -108,9 +114,15 @@ class Weaver(BaseEngine):
         messages = self._prepare_messages(paragraph, mini_glossary)
 
         full_translation = ""
-        async for chunk in self._call_ollama_streaming(messages):
-            full_translation += chunk
-            yield chunk
+        try:
+            async for chunk in self.provider_manager.generate_streaming(messages):
+                full_translation += chunk
+                yield chunk
+        except ProviderError as e:
+            raise TranslationError(
+                f"Streaming translation failed: {e.message}",
+                details=f"Provider: {e.provider}",
+            ) from e
 
         self._verify_translation(paragraph, full_translation, mini_glossary)
 
@@ -136,9 +148,15 @@ class Weaver(BaseEngine):
         messages = self._prepare_messages(text_to_translate, mini_glossary, context)
         
         full_translation = ""
-        async for chunk in self._call_ollama_streaming(messages):
-            full_translation += chunk
-            yield chunk
+        try:
+            async for chunk in self.provider_manager.generate_streaming(messages):
+                full_translation += chunk
+                yield chunk
+        except ProviderError as e:
+            raise TranslationError(
+                f"Batch streaming translation failed: {e.message}",
+                details=f"Provider: {e.provider}",
+            ) from e
         
         self._verify_translation(text_to_translate, full_translation, mini_glossary)
         
@@ -181,7 +199,6 @@ class Weaver(BaseEngine):
             GlossaryTerm.project == self.project
         )
 
-
         keyword_processor = KeywordProcessor(case_sensitive=False)
         term_map: dict[str, str] = {}
         
@@ -205,99 +222,6 @@ class Weaver(BaseEngine):
                 mini_glossary[found_term] = target
 
         return mini_glossary
-
-    async def _call_ollama(self, messages: list[dict]) -> str:
-        """Call Ollama API for translation with retry logic."""
-        url = f"{self.ollama_url}/api/chat"
-
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "stream": False,
-            "options": {
-                "temperature": 0.6
-            }
-        }
-
-        for attempt in range(self.max_retries + 1):
-            try:
-                async with httpx.AsyncClient(timeout=self.timeout) as client:
-                    response = await client.post(url, json=payload)
-
-                    if response.status_code != 200:
-                        raise WeaverError(
-                            f"Ollama API returned status {response.status_code}: {response.text}"
-                        )
-
-                    result = response.json()
-                    return result.get("message", {}).get("content", "").strip()
-
-            except httpx.TimeoutException as e:
-                if attempt < self.max_retries:
-                    wait_time = 2 ** attempt
-                    logger.warning(
-                        "Ollama timeout, retrying",
-                        attempt=attempt + 1,
-                        wait_time=wait_time,
-                    )
-                    await asyncio.sleep(wait_time)
-                else:
-                    raise TranslationError(
-                        f"Ollama request timed out after {self.max_retries + 1} attempts"
-                    ) from e
-
-            except httpx.RequestError as e:
-                raise TranslationError(
-                    f"Failed to connect to Ollama at {self.ollama_url}: {e}"
-                ) from e
-
-            except Exception as e:
-                raise TranslationError(f"Unexpected error calling Ollama: {e}") from e
-
-        raise TranslationError("Failed to get translation after retries")
-
-    async def _call_ollama_streaming(
-        self, messages: list[dict]
-    ) -> AsyncIterator[str]:
-        """Call Ollama API with streaming response."""
-        url = f"{self.ollama_url}/api/chat"
-
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "stream": True,
-            "options": {"temperature": 0.6}
-        }
-
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                async with client.stream("POST", url, json=payload) as response:
-                    if response.status_code != 200:
-                        text = await response.aread()
-                        raise WeaverError(
-                            f"Ollama API returned status {response.status_code}: {text.decode()}"
-                        )
-
-                    async for line in response.aiter_lines():
-                        if not line:
-                            continue
-
-                        try:
-                            data = json.loads(line)
-                            content = data.get("message", {}).get("content", "")
-                            if content:
-                                yield content
-                        except json.JSONDecodeError:
-                            continue
-
-        except httpx.TimeoutException as e:
-            raise TranslationError(f"Ollama streaming request timed out: {e}") from e
-        except httpx.RequestError as e:
-            raise TranslationError(
-                f"Failed to connect to Ollama at {self.ollama_url}: {e}"
-            ) from e
-        except Exception as e:
-            raise TranslationError(f"Unexpected error streaming from Ollama: {e}") from e
 
     def _verify_translation(
         self, source: str, translation: str, mini_glossary: dict[str, str]

@@ -1,13 +1,16 @@
 """Main screen for the LexiconWeaver TUI."""
 
+import asyncio
 from pathlib import Path
-from textual.containers import Container, Horizontal, ScrollableContainer, Vertical
+
+from textual.containers import Horizontal, ScrollableContainer, Vertical
 from textual.screen import Screen
 from textual.widgets import Footer, Header, Input, Static
 
 from lexiconweaver.config import Config
-from lexiconweaver.database.models import GlossaryTerm, Project
+from lexiconweaver.database.models import GlossaryTerm, IgnoredTerm, ProposedTerm, Project
 from lexiconweaver.engines.scout import CandidateTerm, Scout
+from lexiconweaver.engines.scout_refiner import RefinedTerm, ScoutRefiner
 from lexiconweaver.logging_config import get_logger
 from lexiconweaver.tui.screens.translation_screen import TranslationScreen
 from lexiconweaver.tui.widgets.candidate_list import CandidateList
@@ -25,6 +28,7 @@ class MainScreen(Screen):
     BINDINGS = [
         ("q", "quit", "Quit"),
         ("r", "run_scout", "Run Scout"),
+        ("s", "run_smart_scout", "Smart Scout"),
         ("t", "translate", "Translate"),
     ]
 
@@ -88,10 +92,13 @@ class MainScreen(Screen):
         self._text = text
         self._text_file = text_file
         self._scout: Scout | None = None
+        self._scout_refiner: ScoutRefiner | None = None
         self._candidates: list[CandidateTerm] = []
+        self._refined_terms: list[RefinedTerm] = []
         self._confirmed_terms: set[str] = set()
         self._candidate_terms: set[str] = set()
         self._cache = get_cache()
+        self._smart_scout_running = False
 
     def compose(self):
         """Compose the screen widgets."""
@@ -108,13 +115,12 @@ class MainScreen(Screen):
                     id="candidate_search",
                 )
                 yield CandidateList(id="candidate_list")
-        yield Static("Ready", id="status_bar")
+        yield Static("Ready | r: Scout | s: Smart Scout | t: Translate", id="status_bar")
         yield Footer()
 
     def on_mount(self) -> None:
         """Called when the screen is mounted."""
         logger.debug("MainScreen mounted, deferring initialization until widgets are ready")
-        # Use call_after_refresh to ensure widgets are fully ready before accessing them
         self.call_after_refresh(self._initialize_screen)
 
     def _initialize_screen(self) -> None:
@@ -128,7 +134,6 @@ class MainScreen(Screen):
             logger.debug("Screen initialization completed successfully")
         except Exception as e:
             logger.exception("Error initializing screen", error=str(e))
-            # Try to update status if possible
             self._safe_update_status(f"Error: {e}")
 
     def _load_text(self) -> None:
@@ -169,16 +174,7 @@ class MainScreen(Screen):
         logger.debug("Loaded confirmed terms", count=len(self._confirmed_terms))
 
     def _get_terms_with_translations(self, term_list: list[str]) -> set[str]:
-        """Get set of terms that already have translations in the database.
-        
-        Uses cache to avoid repeated database queries.
-        
-        Args:
-            term_list: List of source terms to check
-            
-        Returns:
-            Set of source terms that have translations
-        """
+        """Get set of terms that already have translations in the database."""
         if not term_list:
             return set()
         
@@ -209,7 +205,6 @@ class MainScreen(Screen):
             logger.debug("Highlights updated", highlight_count=len(highlights))
         except Exception as e:
             logger.exception("Error updating highlights", error=str(e))
-            # Don't raise - highlights are not critical for basic functionality
 
     def _initialize_scout(self) -> None:
         """Initialize the Scout engine."""
@@ -218,7 +213,6 @@ class MainScreen(Screen):
             logger.debug("Scout engine initialized")
         except Exception as e:
             logger.exception("Error initializing Scout", error=str(e))
-            # Don't raise - Scout can be initialized later if needed
 
     def action_run_scout(self) -> None:
         """Run the Scout to find candidate terms."""
@@ -232,8 +226,8 @@ class MainScreen(Screen):
         try:
             self._candidates = self._scout.process(self._text)
             self._candidate_terms = {c.term for c in self._candidates}
+            self._refined_terms = []  # Clear any refined terms
 
-            # Get terms that already have translations in the database
             terms_with_translations = self._get_terms_with_translations([c.term for c in self._candidates])
 
             candidate_list = self.query_one("#candidate_list", CandidateList)
@@ -246,13 +240,68 @@ class MainScreen(Screen):
             logger.exception("Scout error", error=str(e))
             self._safe_update_status(f"Scout error: {e}")
 
+    def action_run_smart_scout(self) -> None:
+        """Run the Smart Scout (two-pass with LLM refinement)."""
+        if self._smart_scout_running:
+            self._safe_update_status("Smart Scout is already running...")
+            return
+
+        if not self._text:
+            self._safe_update_status("No text to analyze")
+            return
+
+        self._smart_scout_running = True
+        self._safe_update_status("Smart Scout: Initializing LLM...")
+        
+        # Run the async task
+        asyncio.create_task(self._run_smart_scout_async())
+
+    async def _run_smart_scout_async(self) -> None:
+        """Run the Smart Scout asynchronously."""
+        try:
+            self._scout_refiner = ScoutRefiner(self.config, self.project)
+            
+            self._safe_update_status("Smart Scout: Running heuristic pass...")
+            
+            self._refined_terms = await self._scout_refiner.refine_text(self._text)
+            
+            self._safe_update_status(f"Smart Scout: Saving {len(self._refined_terms)} proposals...")
+            
+            saved_count = await self._scout_refiner.save_proposals(self._refined_terms)
+            
+            self._candidates = [
+                CandidateTerm(
+                    term=rt.source_term,
+                    confidence=0.9,
+                    frequency=1,
+                    context_pattern="llm_refined",
+                    context_snippet=rt.context_snippet,
+                )
+                for rt in self._refined_terms
+                if rt.is_valid
+            ]
+            self._candidate_terms = {c.term for c in self._candidates}
+            
+            terms_with_translations = self._get_terms_with_translations([c.term for c in self._candidates])
+            
+            candidate_list = self.query_one("#candidate_list", CandidateList)
+            candidate_list.set_candidates(self._candidates, terms_with_translations, has_proposals=True)
+            
+            self._update_highlights()
+            self._safe_update_status(f"Smart Scout: Found {len(self._candidates)} terms, saved {saved_count} proposals")
+            
+        except Exception as e:
+            logger.exception("Smart Scout error", error=str(e))
+            self._safe_update_status(f"Smart Scout error: {str(e)[:60]}")
+        finally:
+            self._smart_scout_running = False
+
     def action_translate(self) -> None:
         """Start translation process."""
         if not self._text:
             self._safe_update_status("No text to translate")
             return
         
-        # Push translation screen
         translation_screen = TranslationScreen(
             config=self.config,
             project=self.project,
@@ -262,13 +311,12 @@ class MainScreen(Screen):
         self.app.push_screen(translation_screen)
 
     def _safe_update_status(self, message: str) -> None:
-        """Update the status bar safely, handling cases where it may not be ready."""
+        """Update the status bar safely."""
         try:
             status_bar = self.query_one("#status_bar", Static)
             status_bar.update(message)
             logger.debug("Status updated", message=message)
         except Exception as e:
-            # Status bar not ready or query failed, log but don't raise
             logger.debug("Could not update status bar", message=message, error=str(e))
 
     def on_candidate_list_selected(self, message: CandidateList.Selected) -> None:
@@ -280,17 +328,24 @@ class MainScreen(Screen):
         """Handle candidate ignore."""
         candidate = message.candidate
         try:
-            from lexiconweaver.database.models import IgnoredTerm
-
             IgnoredTerm.get_or_create(
                 project=self.project, term=candidate.term
             )
             self._cache.invalidate_ignored_terms(self.project)
             
-            # Remove from candidate list
+            try:
+                proposed = ProposedTerm.get_or_none(
+                    ProposedTerm.project == self.project,
+                    ProposedTerm.source_term == candidate.term,
+                )
+                if proposed:
+                    proposed.status = "rejected"
+                    proposed.save()
+            except Exception:
+                pass
+            
             self._candidates = [c for c in self._candidates if c.term != candidate.term]
             
-            # Get terms that still have translations (for green coloring)
             terms_with_translations = self._get_terms_with_translations([c.term for c in self._candidates])
             
             candidate_list = self.query_one("#candidate_list", CandidateList)
@@ -319,25 +374,20 @@ class MainScreen(Screen):
         candidate = message.candidate
         term = candidate.term
         
-        # Find the first occurrence of the term in the text
-        # Try case-sensitive first, then case-insensitive
         position = self._text.find(term)
         if position == -1:
             position = self._text.lower().find(term.lower())
         
         if position != -1:
             try:
-                # Calculate which line the position is on (counting newlines)
                 lines_before = self._text[:position].count('\n')
                 line_number = lines_before + 1
                 
-                # Use call_after_refresh to ensure widgets are ready
                 def do_scroll():
                     try:
                         scroll_container = self.query_one("#text_scroll_container", ScrollableContainer)
-                        target_y = max(0, lines_before - 2)  # Show a few lines before target
+                        target_y = max(0, lines_before - 2)
                         
-                        # Try different ways to scroll
                         if hasattr(scroll_container, 'scroll_y'):
                             scroll_container.scroll_y = target_y
                         elif hasattr(scroll_container, 'scroll_to'):
@@ -361,13 +411,30 @@ class MainScreen(Screen):
 
     def _show_term_modal(self, source_term: str) -> None:
         """Show the term editing modal."""
-        # Check if a modal is already open to prevent duplicates
         existing_modals = self.query(TermModal)
         if existing_modals:
             logger.debug("Modal already open, ignoring duplicate request", term=source_term)
             return
         
-        # Check if term already exists in database to load its data
+        # Check for LLM proposal first
+        proposed_translation = None
+        proposed_category = None
+        llm_reasoning = None
+        
+        try:
+            proposal = ProposedTerm.get_or_none(
+                ProposedTerm.project == self.project,
+                ProposedTerm.source_term == source_term,
+                ProposedTerm.status == "pending",
+            )
+            if proposal:
+                proposed_translation = proposal.proposed_translation
+                proposed_category = proposal.proposed_category
+                llm_reasoning = proposal.llm_reasoning
+        except Exception as e:
+            logger.debug("Error loading proposal", term=source_term, error=str(e))
+        
+        # Check for existing glossary term
         target_term = ""
         category = ""
         is_regex = False
@@ -387,15 +454,16 @@ class MainScreen(Screen):
             source_term=source_term,
             target_term=target_term,
             category=category,
-            is_regex=is_regex
+            is_regex=is_regex,
+            proposed_translation=proposed_translation,
+            proposed_category=proposed_category,
+            llm_reasoning=llm_reasoning,
         )
         self.mount(modal)
 
     def on_term_modal_term_saved(self, message: TermModal.TermSaved) -> None:
         """Handle term save from modal."""
         try:
-            # Use update_or_create to handle both new and existing terms
-            # This ensures category updates work for existing terms
             term, created = GlossaryTerm.get_or_create(
                 project=self.project,
                 source_term=message.source_term,
@@ -405,7 +473,6 @@ class MainScreen(Screen):
                     "is_regex": message.is_regex,
                 },
             )
-            # Update existing term if it already exists
             if not created:
                 term.target_term = message.target_term
                 term.category = message.category if message.category else None
@@ -414,21 +481,62 @@ class MainScreen(Screen):
             
             self._cache.invalidate_glossary_terms(self.project)
             
+            if message.was_proposal:
+                try:
+                    proposed = ProposedTerm.get_or_none(
+                        ProposedTerm.project == self.project,
+                        ProposedTerm.source_term == message.source_term,
+                    )
+                    if proposed:
+                        if message.action == "approve":
+                            proposed.status = "approved"
+                        elif message.action == "modify":
+                            proposed.status = "modified"
+                            proposed.user_translation = message.target_term
+                            proposed.user_category = message.category
+                        proposed.save()
+                except Exception as e:
+                    logger.debug("Error updating proposal status", error=str(e))
+            
             self._confirmed_terms.add(message.source_term)
             self._candidate_terms.discard(message.source_term)
             self._update_highlights()
             
-            # Refresh candidate list to show updated translation status (green color)
             if self._candidates:
                 terms_with_translations = self._get_terms_with_translations([c.term for c in self._candidates])
                 candidate_list = self.query_one("#candidate_list", CandidateList)
                 candidate_list.set_candidates(self._candidates, terms_with_translations)
             
-            self._safe_update_status(f"Saved term: {message.source_term} -> {message.target_term}")
-            logger.debug("Term saved", source=message.source_term, target=message.target_term, category=message.category)
+            action_str = f"({message.action})" if message.was_proposal else ""
+            self._safe_update_status(f"Saved {action_str}: {message.source_term} -> {message.target_term}")
+            logger.debug("Term saved", source=message.source_term, target=message.target_term, action=message.action)
         except Exception as e:
             logger.exception("Error saving term", source=message.source_term, error=str(e))
             self._safe_update_status(f"Error saving term: {e}")
+
+    def on_term_modal_term_rejected(self, message: TermModal.TermRejected) -> None:
+        """Handle term rejection from modal."""
+        try:
+            proposed = ProposedTerm.get_or_none(
+                ProposedTerm.project == self.project,
+                ProposedTerm.source_term == message.source_term,
+            )
+            if proposed:
+                proposed.status = "rejected"
+                proposed.save()
+            
+            self._candidates = [c for c in self._candidates if c.term != message.source_term]
+            self._candidate_terms.discard(message.source_term)
+            
+            terms_with_translations = self._get_terms_with_translations([c.term for c in self._candidates])
+            candidate_list = self.query_one("#candidate_list", CandidateList)
+            candidate_list.set_candidates(self._candidates, terms_with_translations)
+            
+            self._safe_update_status(f"Rejected: {message.source_term}")
+            logger.debug("Term rejected", term=message.source_term)
+        except Exception as e:
+            logger.exception("Error rejecting term", term=message.source_term, error=str(e))
+            self._safe_update_status(f"Error rejecting term: {e}")
 
     def on_term_modal_cancelled(self, message: TermModal.Cancelled) -> None:
         """Handle modal cancellation."""

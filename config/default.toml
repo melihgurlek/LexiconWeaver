@@ -12,6 +12,26 @@ timeout = 300
 # Maximum retries for failed requests
 max_retries = 3
 
+[deepseek]
+# DeepSeek API key - set via LEXICONWEAVER_DEEPSEEK__API_KEY environment variable for security
+api_key = ""
+# DeepSeek model name (V3 is "deepseek-chat")
+model = "deepseek-chat"
+# DeepSeek API base URL
+base_url = "https://api.deepseek.com"
+# Request timeout in seconds
+timeout = 120
+# Maximum retries for failed requests
+max_retries = 3
+
+[provider]
+# Primary LLM provider: "ollama" or "deepseek"
+primary = "ollama"
+# Fallback provider when primary fails: "ollama", "deepseek", or "none"
+fallback = "none"
+# Use fallback on provider errors
+fallback_on_error = true
+
 [database]
 # Path to the SQLite database file
 # If relative, will be resolved relative to the project directory
@@ -39,6 +59,10 @@ min_confidence = 0.3
 max_ngram_size = 4
 # Enable POS tagging filter (requires spacy model)
 use_pos_filter = true
+# Enable two-pass LLM refinement for Smart Scout
+use_llm_refinement = true
+# Number of terms per LLM API call (for batching performance)
+llm_batch_size = 50
 
 [weaver]
 # Number of paragraphs to process in parallel (0 = sequential)

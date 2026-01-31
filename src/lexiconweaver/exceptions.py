@@ -46,3 +46,13 @@ class ValidationError(LexiconWeaverError):
     """Error in input validation."""
 
     pass
+
+
+class ProviderError(LexiconWeaverError):
+    """Error in LLM provider operations."""
+
+    def __init__(
+        self, message: str, provider: str, details: Optional[str] = None
+    ) -> None:
+        super().__init__(message, details)
+        self.provider = provider

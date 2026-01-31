@@ -2,7 +2,7 @@
 
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 import toml
 from pydantic import Field, field_validator
@@ -20,6 +20,39 @@ class OllamaConfig(BaseSettings):
     model: str = Field(default="llama3.1:latest", description="Model name to use")
     timeout: int = Field(default=300, ge=1, description="Request timeout in seconds")
     max_retries: int = Field(default=3, ge=0, le=10, description="Maximum retries")
+
+
+class DeepSeekConfig(BaseSettings):
+    """Configuration for DeepSeek API connection."""
+
+    model_config = SettingsConfigDict(extra="allow")
+
+    api_key: str = Field(
+        default="",
+        description="DeepSeek API key (set via LEXICONWEAVER_DEEPSEEK__API_KEY)",
+    )
+    model: str = Field(default="deepseek-chat", description="DeepSeek model name (V3)")
+    base_url: str = Field(
+        default="https://api.deepseek.com", description="DeepSeek API base URL"
+    )
+    timeout: int = Field(default=120, ge=1, description="Request timeout in seconds")
+    max_retries: int = Field(default=3, ge=0, le=10, description="Maximum retries")
+
+
+class ProviderConfig(BaseSettings):
+    """Configuration for LLM provider selection."""
+
+    model_config = SettingsConfigDict(extra="allow")
+
+    primary: Literal["ollama", "deepseek"] = Field(
+        default="ollama", description="Primary LLM provider"
+    )
+    fallback: Literal["ollama", "deepseek", "none"] = Field(
+        default="none", description="Fallback provider when primary fails"
+    )
+    fallback_on_error: bool = Field(
+        default=True, description="Use fallback on provider errors"
+    )
 
 
 class DatabaseConfig(BaseSettings):
@@ -72,6 +105,12 @@ class ScoutConfig(BaseSettings):
     use_pos_filter: bool = Field(
         default=True, description="Enable POS tagging filter"
     )
+    use_llm_refinement: bool = Field(
+        default=True, description="Enable two-pass LLM refinement for Smart Scout"
+    )
+    llm_batch_size: int = Field(
+        default=50, ge=1, le=100, description="Terms per LLM API call for batching"
+    )
 
 
 class WeaverConfig(BaseSettings):
@@ -109,6 +148,8 @@ class Config(BaseSettings):
     )
 
     ollama: OllamaConfig = Field(default_factory=OllamaConfig)
+    deepseek: DeepSeekConfig = Field(default_factory=DeepSeekConfig)
+    provider: ProviderConfig = Field(default_factory=ProviderConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     cache: CacheConfig = Field(default_factory=CacheConfig)
