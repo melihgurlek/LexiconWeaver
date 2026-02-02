@@ -210,23 +210,3 @@ MIT License
 ## Contributing
 
 Contributions are welcome! Please open an issue or submit a pull request.
-
-## Troubleshooting
-
-### Ollama Connection Issues
-
-If you see connection errors, ensure Ollama is running:
-
-```bash
-ollama serve
-```
-
-### Database Lock Errors
-
-If you encounter database locking issues, ensure only one instance of LexiconWeaver is accessing the database at a time.
-
-### Encoding Issues
-
-LexiconWeaver automatically detects file encoding. If issues persist, ensure your text files are UTF-8 encoded.
-
-For more information, see [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
