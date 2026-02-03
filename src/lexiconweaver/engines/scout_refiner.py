@@ -3,8 +3,9 @@
 import asyncio
 import json
 import re
+from collections import Counter
 from dataclasses import dataclass
-from typing import AsyncIterator, Callable
+from typing import Callable
 
 from lexiconweaver.config import Config
 from lexiconweaver.database.models import GlossaryTerm, ProposedTerm, Project
@@ -84,6 +85,10 @@ class ScoutRefiner(BaseEngine):
         candidates = self.scout.process(text)
         logger.info("Scout found candidates", count=len(candidates))
 
+        # Reuse Scout's n-gram maps for missed-term frequency (no rescan)
+        ngram_maps = self.scout.get_last_ngram_maps()
+        freq_map: Counter[str] | None = ngram_maps[0] if ngram_maps else None
+
         new_candidates = [
             c for c in candidates
             if c.term.lower() not in existing_terms
@@ -107,7 +112,7 @@ class ScoutRefiner(BaseEngine):
         _progress("Smart Scout: Pass 2b — finding missed terms...")
         await asyncio.sleep(0)
         logger.info("Finding missed terms with LLM (Pass 2b)")
-        missed = await self._find_missed_terms(text, refined)
+        missed = await self._find_missed_terms(text, refined, freq_map=freq_map)
         logger.info("LLM found missed terms", count=len(missed))
 
         if missed:
@@ -174,12 +179,14 @@ class ScoutRefiner(BaseEngine):
         self,
         text: str,
         found_terms: list[CandidateTerm] | list[RefinedTerm],
+        freq_map: Counter[str] | None = None,
     ) -> list[CandidateTerm]:
         """Use LLM to find terms that Scout missed.
 
         Args:
             text: The source text.
             found_terms: Terms already found (CandidateTerm or RefinedTerm).
+            freq_map: Optional pre-built n-gram frequency map from Scout (avoids rescan).
 
         Returns:
             List of newly discovered candidates.
@@ -194,7 +201,9 @@ class ScoutRefiner(BaseEngine):
 
         try:
             response = await self.provider_manager.generate(prompt)
-            missed = self._parse_find_missed_response(response, text)
+            missed = self._parse_find_missed_response(
+                response, text, freq_map=freq_map
+            )
 
             new_missed = []
             for term in missed:
@@ -432,9 +441,16 @@ class ScoutRefiner(BaseEngine):
         return results
 
     def _parse_find_missed_response(
-        self, response: str, text: str
+        self,
+        response: str,
+        text: str,
+        freq_map: Counter[str] | None = None,
     ) -> list[CandidateTerm]:
-        """Parse the LLM response for find missed pass."""
+        """Parse the LLM response for find missed pass.
+
+        Uses freq_map from Scout when provided (O(1) lookup) instead of
+        rescanning text for each term.
+        """
         missed: list[CandidateTerm] = []
 
         try:
@@ -444,11 +460,17 @@ class ScoutRefiner(BaseEngine):
                 if isinstance(terms, list):
                     for term in terms:
                         if isinstance(term, str) and term.strip():
-                            context = self._extract_context(term, text)
+                            t = term.strip()
+                            key = " ".join(t.lower().split())
+                            if freq_map is not None:
+                                frequency = freq_map.get(key, 0)
+                            else:
+                                frequency = text.lower().count(key)
+                            context = self._extract_context(t, text)
                             missed.append(CandidateTerm(
-                                term=term.strip(),
+                                term=t,
                                 confidence=0.8,
-                                frequency=text.lower().count(term.lower()),
+                                frequency=frequency,
                                 context_pattern="llm_discovered",
                                 context_snippet=context,
                             ))

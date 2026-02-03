@@ -91,6 +91,8 @@ class Scout(BaseEngine):
         self._cache = get_cache()
         self._sentences: list[str] = []
         self._word_to_sentence_ids: dict[str, list[int]] = {}
+        self._last_freq_map: Counter[str] | None = None
+        self._last_caps_map: Counter[str] | None = None
 
     def _build_ngram_maps(
         self, text: str
@@ -118,6 +120,18 @@ class Scout(BaseEngine):
                     caps_map[ngram_lower] += 1
         return freq_map, caps_map
 
+    def get_last_ngram_maps(
+        self,
+    ) -> tuple[Counter[str], Counter[str]] | None:
+        """Return the frequency and caps maps from the last process() run for reuse.
+
+        Returns (freq_map, caps_map) if process() has been called, else None.
+        Refiner can use these for missed-term frequency without rescanning text.
+        """
+        if self._last_freq_map is None or self._last_caps_map is None:
+            return None
+        return self._last_freq_map, self._last_caps_map
+
     def _build_sentence_index(self) -> None:
         """Build inverted index: word_lower -> list of sentence indices."""
         self._word_to_sentence_ids = {}
@@ -137,6 +151,8 @@ class Scout(BaseEngine):
             candidates, pattern_matches = self._extract_candidates(text)
             filtered = self._filter_candidates(candidates, ignored_terms)
             freq_map, caps_map = self._build_ngram_maps(text)
+            self._last_freq_map = freq_map
+            self._last_caps_map = caps_map
 
             # Calculate confidence scores
             scored = self._score_candidates(
