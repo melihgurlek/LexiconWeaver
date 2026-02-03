@@ -98,99 +98,96 @@ class ScoutRefiner(BaseEngine):
             logger.info("No new candidates to refine")
             return []
 
-        _progress("Smart Scout: Pass 2a — cleaning candidates with LLM...")
+        _progress("Smart Scout: Pass 2a — filter and propose (LLM)...")
         await asyncio.sleep(0)
-        logger.info("Cleaning candidates with LLM (Pass 2a)")
-        cleaned = await self._clean_candidates(new_candidates, text)
-        logger.info("LLM validated candidates", count=len(cleaned))
+        logger.info("Filter and propose for candidates (Pass 2a)")
+        refined = await self._filter_and_propose(new_candidates, text)
+        logger.info("LLM filter+propose results", count=len(refined))
 
         _progress("Smart Scout: Pass 2b — finding missed terms...")
         await asyncio.sleep(0)
         logger.info("Finding missed terms with LLM (Pass 2b)")
-        missed = await self._find_missed_terms(text, cleaned)
+        missed = await self._find_missed_terms(text, refined)
         logger.info("LLM found missed terms", count=len(missed))
 
-        all_terms = cleaned + missed
-
-        if not all_terms:
-            logger.info("No valid terms found after LLM refinement")
-            return []
-
-        _progress("Smart Scout: Pass 2c — proposing translations...")
-        await asyncio.sleep(0)
-        logger.info("Proposing translations with LLM (Pass 2c)")
-        refined = await self._propose_translations(all_terms, text)
-        logger.info("Generated proposals", count=len(refined))
+        if missed:
+            _progress("Smart Scout: Pass 2c — proposing translations for missed terms...")
+            await asyncio.sleep(0)
+            logger.info("Proposing translations for missed terms (Pass 2c)")
+            missed_refined = await self._propose_translations(missed, text)
+            refined = refined + missed_refined
+            logger.info("Generated proposals for missed", count=len(missed_refined))
 
         return refined
 
-    async def _clean_candidates(
+    async def _filter_and_propose(
         self, candidates: list[CandidateTerm], text: str
-    ) -> list[CandidateTerm]:
-        """Use LLM to filter false positives from candidates.
-        
-        Args:
-            candidates: Raw candidates from Scout.
-            text: The source text for context.
-        
+    ) -> list[RefinedTerm]:
+        """Single LLM pass: filter invalid candidates and propose translation+category for valid ones.
+
         Returns:
-            Filtered list of valid candidates.
+            List of RefinedTerm for candidates the LLM considered valid (invalid omitted).
         """
         if not candidates:
             return []
 
         batches = [
-            candidates[i:i + self.batch_size]
+            candidates[i : i + self.batch_size]
             for i in range(0, len(candidates), self.batch_size)
         ]
-
-        valid_terms: set[str] = set()
+        results: list[RefinedTerm] = []
 
         for batch_idx, batch in enumerate(batches):
             logger.debug(
-                "Processing clean batch",
+                "Processing filter+propose batch",
                 batch=batch_idx + 1,
                 total=len(batches),
                 size=len(batch),
             )
-
-            terms_with_context = []
-            for candidate in batch:
-                context = candidate.context_snippet or ""
-                terms_with_context.append({
-                    "term": candidate.term,
-                    "context": context[:200] if context else "",
-                })
-
-            prompt = self._build_clean_prompt(terms_with_context)
-
+            terms_with_context = [
+                {
+                    "term": c.term,
+                    "context": (c.context_snippet or "")[:200],
+                }
+                for c in batch
+            ]
+            prompt = self._build_filter_and_propose_prompt(terms_with_context)
             try:
                 response = await self.provider_manager.generate(prompt)
-                valid_in_batch = self._parse_clean_response(response, batch)
-                valid_terms.update(valid_in_batch)
+                batch_results = self._parse_filter_and_propose_response(
+                    response, batch
+                )
+                results.extend(batch_results)
             except ProviderError as e:
                 logger.warning(
-                    "LLM clean batch failed, keeping all candidates",
+                    "LLM filter+propose batch failed",
                     batch=batch_idx + 1,
                     error=str(e),
                 )
-                valid_terms.update(c.term.lower() for c in batch)
+                # Fallback: treat all in batch as valid and run translation-only
+                fallback = await self._propose_translations(batch, text)
+                results.extend(fallback)
 
-        return [c for c in candidates if c.term.lower() in valid_terms]
+        return results
 
     async def _find_missed_terms(
-        self, text: str, found_terms: list[CandidateTerm]
+        self,
+        text: str,
+        found_terms: list[CandidateTerm] | list[RefinedTerm],
     ) -> list[CandidateTerm]:
         """Use LLM to find terms that Scout missed.
-        
+
         Args:
             text: The source text.
-            found_terms: Terms already found.
-        
+            found_terms: Terms already found (CandidateTerm or RefinedTerm).
+
         Returns:
             List of newly discovered candidates.
         """
-        found_set = {t.term.lower() for t in found_terms}
+        found_set = {
+            getattr(t, "source_term", getattr(t, "term", "")).lower()
+            for t in found_terms
+        }
         existing = self._get_existing_terms()
 
         prompt = self._build_find_missed_prompt(text, list(found_set))
@@ -280,48 +277,6 @@ class ScoutRefiner(BaseEngine):
 
         return results
 
-    def _build_clean_prompt(
-        self, terms_with_context: list[dict[str, str]]
-    ) -> list[dict[str, str]]:
-        """Build the prompt for cleaning candidates."""
-        terms_list = "\n".join(
-            f"- Term: \"{t['term']}\"\n  Context: \"{t['context']}\""
-            for t in terms_with_context
-        )
-
-        system_content = (
-            "You are an expert in Wuxia/Xianxia fantasy literature terminology. "
-            "Your task is to identify which candidate terms are actual proper nouns, "
-            "skills, items, locations, cultivation terms, or other important terms "
-            "that should be consistently translated.\n\n"
-            "CRITERIA FOR VALID TERMS:\n"
-            "- Names of people (e.g., Fang Yuan, Li Qing)\n"
-            "- Names of places (e.g., Qing Mao Mountain, Blue Wave Sect)\n"
-            "- Cultivation terms (e.g., Golden Core, Nascent Soul)\n"
-            "- Skills/techniques (e.g., Sword Drawing Art, Heaven Swallowing)\n"
-            "- Items (e.g., Spirit Stone, Gu worm names)\n"
-            "- Clans/Sects (e.g., Gu Yue Clan, Bai Clan)\n"
-            "- Titles (e.g., Gu Master, Demon Lord)\n\n"
-            "INVALID TERMS (should be rejected):\n"
-            "- Common English words incorrectly flagged\n"
-            "- Generic descriptions (e.g., 'The Mountain', 'His Technique')\n"
-            "- Sentence fragments\n"
-            "- Partial terms\n"
-        )
-
-        user_content = (
-            "Analyze these candidate terms and determine which are valid:\n\n"
-            f"{terms_list}\n\n"
-            "Return a JSON array of valid term strings (only the term names):\n"
-            "Example: [\"Fang Yuan\", \"Golden Core\", \"Qing Mao Mountain\"]\n\n"
-            "Return ONLY the JSON array, no explanation."
-        )
-
-        return [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": user_content},
-        ]
-
     def _build_find_missed_prompt(
         self, text: str, found_terms: list[str]
     ) -> list[dict[str, str]]:
@@ -401,23 +356,80 @@ class ScoutRefiner(BaseEngine):
             {"role": "user", "content": user_content},
         ]
 
-    def _parse_clean_response(
+    def _build_filter_and_propose_prompt(
+        self, terms_with_context: list[dict[str, str]]
+    ) -> list[dict[str, str]]:
+        """Build the merged prompt: filter invalid and propose translation+category for valid terms."""
+        terms_list = "\n".join(
+            f"{i+1}. Term: \"{t['term']}\"\n   Context: \"{t['context']}\""
+            for i, t in enumerate(terms_with_context)
+        )
+        categories_str = ", ".join(self.CATEGORIES)
+
+        system_content = (
+            "You are an expert in Wuxia/Xianxia fantasy literature terminology "
+            "and a translator from English to Turkish. For each candidate term below:\n"
+            "1. Decide if it is a real proper noun, skill, item, location, cultivation term, "
+            "or other term that should be consistently translated (VALID).\n"
+            "2. If VALID: provide proposed Turkish translation, category, and brief reasoning.\n"
+            "3. If INVALID (common words, fragments, generic phrases): omit it from your response.\n\n"
+            "VALID: character/place names, cultivation terms, skills, items, clans, titles.\n"
+            "INVALID: common English words, sentence fragments, partial or generic phrases.\n\n"
+            f"Categories: {categories_str}"
+        )
+
+        user_content = (
+            "Analyze these candidate terms. For each that is valid, output one object with: "
+            "term (original), translation (Turkish), category, reasoning. Omit invalid ones.\n\n"
+            f"{terms_list}\n\n"
+            "Return a JSON array of objects: "
+            "{\"term\": \"...\", \"translation\": \"...\", \"category\": \"...\", \"reasoning\": \"...\"}\n\n"
+            "Return ONLY the JSON array, no explanation."
+        )
+
+        return [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": user_content},
+        ]
+
+    def _parse_filter_and_propose_response(
         self, response: str, batch: list[CandidateTerm]
-    ) -> set[str]:
-        """Parse the LLM response for clean pass."""
-        valid_terms: set[str] = set()
+    ) -> list[RefinedTerm]:
+        """Parse the LLM response from filter+propose (valid terms with translation and category)."""
+        results: list[RefinedTerm] = []
+        batch_map = {c.term.lower(): c for c in batch}
 
         try:
-            json_match = re.search(r'\[.*\]', response, re.DOTALL)
+            json_match = re.search(r"\[.*\]", response, re.DOTALL)
             if json_match:
-                terms = json.loads(json_match.group())
-                if isinstance(terms, list):
-                    valid_terms = {t.lower() for t in terms if isinstance(t, str)}
+                proposals = json.loads(json_match.group())
+                if isinstance(proposals, list):
+                    for prop in proposals:
+                        if isinstance(prop, dict):
+                            term = prop.get("term", "")
+                            candidate = batch_map.get(term.lower())
+                            results.append(
+                                RefinedTerm(
+                                    source_term=term,
+                                    proposed_translation=prop.get(
+                                        "translation", term
+                                    ),
+                                    proposed_category=prop.get("category"),
+                                    reasoning=prop.get("reasoning"),
+                                    context_snippet=(
+                                        candidate.context_snippet
+                                        if candidate
+                                        else None
+                                    ),
+                                    is_valid=True,
+                                )
+                            )
         except (json.JSONDecodeError, AttributeError) as e:
-            logger.warning("Failed to parse clean response", error=str(e))
-            valid_terms = {c.term.lower() for c in batch}
+            logger.warning(
+                "Failed to parse filter+propose response", error=str(e)
+            )
 
-        return valid_terms
+        return results
 
     def _parse_find_missed_response(
         self, response: str, text: str

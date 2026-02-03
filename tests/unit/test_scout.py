@@ -19,11 +19,13 @@ def test_scout_initialization(config: Config, initialized_db: Project) -> None:
 def test_scout_extract_candidates(config: Config, initialized_db: Project, sample_text: str) -> None:
     """Test candidate extraction."""
     scout = Scout(config, initialized_db)
-    candidates = scout._extract_candidates(sample_text)
+    scout._sentences = scout._split_into_sentences(sample_text)
+    candidates, pattern_matches = scout._extract_candidates(sample_text)
 
     assert len(candidates) > 0
     assert any("golden core" in c.lower() for c in candidates)
     assert any("void step" in c.lower() for c in candidates)
+    assert isinstance(pattern_matches, dict)
 
 
 def test_scout_filter_candidates(config: Config, initialized_db: Project) -> None:
@@ -43,9 +45,14 @@ def test_scout_filter_candidates(config: Config, initialized_db: Project) -> Non
 def test_scout_score_candidates(config: Config, initialized_db: Project, sample_text: str) -> None:
     """Test candidate scoring."""
     scout = Scout(config, initialized_db)
+    scout._sentences = scout._split_into_sentences(sample_text)
+    scout._build_sentence_index()
+    freq_map, caps_map = scout._build_ngram_maps(sample_text)
     candidates = ["Golden Core", "Void Step"]
 
-    scored = scout._score_candidates(candidates, sample_text)
+    scored = scout._score_candidates(
+        candidates, sample_text, freq_map, caps_map, {}
+    )
 
     assert len(scored) == len(candidates)
     for candidate in scored:

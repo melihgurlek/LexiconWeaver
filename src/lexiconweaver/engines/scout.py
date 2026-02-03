@@ -90,17 +90,58 @@ class Scout(BaseEngine):
         self.max_ngram_size = config.scout.max_ngram_size
         self._cache = get_cache()
         self._sentences: list[str] = []
+        self._word_to_sentence_ids: dict[str, list[int]] = {}
+
+    def _build_ngram_maps(
+        self, text: str
+    ) -> tuple[Counter[str], Counter[str]]:
+        """Build frequency and capitalization maps in one pass over tokenized text.
+
+        Returns:
+            (freq_map, caps_map): lowercased n-gram -> count. caps_map counts
+            occurrences where the span in the original text contains uppercase.
+        """
+        tokens: list[tuple[str, int, int]] = [
+            (m.group(), m.start(), m.end())
+            for m in re.finditer(r"\b\w+\b", text)
+        ]
+        freq_map: Counter[str] = Counter()
+        caps_map: Counter[str] = Counter()
+        for i in range(len(tokens)):
+            for n in range(1, min(self.max_ngram_size + 1, len(tokens) - i + 1)):
+                span_tokens = tokens[i : i + n]
+                ngram_lower = " ".join(t[0].lower() for t in span_tokens)
+                start = span_tokens[0][1]
+                end = span_tokens[-1][2]
+                freq_map[ngram_lower] += 1
+                if any(c.isupper() for c in text[start:end]):
+                    caps_map[ngram_lower] += 1
+        return freq_map, caps_map
+
+    def _build_sentence_index(self) -> None:
+        """Build inverted index: word_lower -> list of sentence indices."""
+        self._word_to_sentence_ids = {}
+        for i, sentence in enumerate(self._sentences):
+            words = re.findall(r"\b\w+\b", sentence.lower())
+            for w in words:
+                if w not in self._word_to_sentence_ids:
+                    self._word_to_sentence_ids[w] = []
+                self._word_to_sentence_ids[w].append(i)
 
     def process(self, text: str) -> list[CandidateTerm]:
         """Process text and return candidate terms with confidence scores."""
         try:
             self._sentences = self._split_into_sentences(text)
+            self._build_sentence_index()
             ignored_terms = self._get_ignored_terms()
-            candidates = self._extract_candidates(text)
+            candidates, pattern_matches = self._extract_candidates(text)
             filtered = self._filter_candidates(candidates, ignored_terms)
+            freq_map, caps_map = self._build_ngram_maps(text)
 
             # Calculate confidence scores
-            scored = self._score_candidates(filtered, text)
+            scored = self._score_candidates(
+                filtered, text, freq_map, caps_map, pattern_matches
+            )
 
             # Filter by minimum confidence
             final = [
@@ -132,32 +173,45 @@ class Scout(BaseEngine):
         sentences = re.split(pattern, text)
         return [s.strip() for s in sentences if s.strip()]
 
-    def _find_context_sentence(self, term: str, text: str) -> str | None:
-        """Find the sentence containing the term for context."""
+    def _find_context_sentence(self, term: str) -> str | None:
+        """Find the sentence containing the term for context using inverted index."""
+        term_words = term.lower().split()
+        if not term_words:
+            return None
+        # Use first word to get candidate sentence IDs; intersect with others if multiple words
+        sentence_ids = set(self._word_to_sentence_ids.get(term_words[0], []))
+        for w in term_words[1:]:
+            sentence_ids &= set(self._word_to_sentence_ids.get(w, []))
         term_lower = term.lower()
-        for sentence in self._sentences:
-            if term_lower in sentence.lower():
-                # Truncate if too long (max ~200 chars)
-                if len(sentence) > 200:
-                    # Try to find the term position and extract around it
-                    idx = sentence.lower().find(term_lower)
-                    start = max(0, idx - 80)
-                    end = min(len(sentence), idx + len(term) + 80)
-                    snippet = sentence[start:end]
-                    if start > 0:
-                        snippet = "..." + snippet
-                    if end < len(sentence):
-                        snippet = snippet + "..."
-                    return snippet
-                return sentence
+        for sid in sentence_ids:
+            sentence = self._sentences[sid]
+            if term_lower not in sentence.lower():
+                continue
+            if len(sentence) > 200:
+                idx = sentence.lower().find(term_lower)
+                start = max(0, idx - 80)
+                end = min(len(sentence), idx + len(term) + 80)
+                snippet = sentence[start:end]
+                if start > 0:
+                    snippet = "..." + snippet
+                if end < len(sentence):
+                    snippet = snippet + "..."
+                return snippet
+            return sentence
         return None
 
-    def _extract_candidates(self, text: str) -> list[str]:
-        """Extract candidate terms from text using multiple strategies."""
+    def _extract_candidates(self, text: str) -> tuple[list[str], dict[str, str]]:
+        """Extract candidate terms from text using multiple strategies.
+
+        Returns:
+            (candidates, pattern_matches): list of candidate strings and
+            dict mapping candidate_lower -> pattern name for definition matches.
+        """
         candidates: set[str] = set()
+        pattern_matches: dict[str, str] = {}
 
         # Strategy 1: Extract from definition patterns
-        for pattern, _ in self.DEFINITION_PATTERNS:
+        for pattern, pattern_name in self.DEFINITION_PATTERNS:
             matches = re.finditer(pattern, text, re.IGNORECASE)
             for match in matches:
                 term = match.group(1).strip()
@@ -165,6 +219,7 @@ class Scout(BaseEngine):
                     term = self._clean_term(term)
                     if term:
                         candidates.add(term)
+                        pattern_matches[term.strip().lower()] = pattern_name
 
         # Strategy 2: Extract capitalized phrases (Proper Nouns)
         capitalized_pattern = r"(?<![.!?]\s)(?<!\A)([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b"
@@ -198,7 +253,7 @@ class Scout(BaseEngine):
                 if any(w[0].isupper() for w in words if w and len(w) > 0):
                     candidates.add(ngram)
 
-        return list(candidates)
+        return list(candidates), pattern_matches
 
     def _clean_term(self, term: str) -> str:
         """Clean up a term by removing trailing common suffixes."""
@@ -240,74 +295,53 @@ class Scout(BaseEngine):
         return filtered
 
     def _score_candidates(
-        self, candidates: list[str], text: str
+        self,
+        candidates: list[str],
+        text: str,
+        freq_map: Counter[str],
+        caps_map: Counter[str],
+        pattern_matches: dict[str, str],
     ) -> list[CandidateTerm]:
-        """Calculate confidence scores for candidates."""
+        """Calculate confidence scores for candidates using prebuilt maps."""
         scored: list[CandidateTerm] = []
 
-        # Count frequencies
-        text_lower = text.lower()
-        frequencies = Counter()
-        capitalization_counts = Counter()
-        pattern_matches: dict[str, str | None] = {}
+        def normalize(s: str) -> str:
+            return " ".join(s.lower().split())
 
+        # Normalize candidate for lookup; fallback count only when missing
+        frequencies: dict[str, int] = {}
+        caps_counts: dict[str, int] = {}
         for candidate in candidates:
-            candidate_lower = candidate.lower()
+            key = normalize(candidate)
+            freq = freq_map.get(key, 0)
+            if freq == 0 and key != candidate.lower():
+                freq = text.lower().count(key)
+            frequencies[candidate] = freq
+            caps_counts[candidate] = caps_map.get(key, 0)
 
-            # Count frequency
-            count = text_lower.count(candidate_lower)
-            frequencies[candidate] = count
-
-            # Count capitalization occurrences
-            capitalized_pattern = re.escape(candidate)
-            caps_matches = len(re.findall(rf"\b{capitalized_pattern}\b", text))
-            capitalization_counts[candidate] = caps_matches
-
-            # Check definition patterns
-            matched_pattern = None
-            for pattern, pattern_name in self.DEFINITION_PATTERNS:
-                try:
-                    match = re.search(pattern, text, re.IGNORECASE)
-                    if match and match.group(1).strip().lower() == candidate_lower:
-                        matched_pattern = pattern_name
-                        break
-                except (IndexError, AttributeError):
-                    continue
-            pattern_matches[candidate] = matched_pattern
-
-        # Calculate scores
         max_freq = max(frequencies.values()) if frequencies else 1
-        max_caps = max(capitalization_counts.values()) if capitalization_counts else 1
+        max_caps = max(caps_counts.values()) if caps_counts else 1
 
         for candidate in candidates:
             freq = frequencies[candidate]
-            caps = capitalization_counts[candidate]
-            has_pattern = pattern_matches[candidate] is not None
+            caps = caps_counts[candidate]
+            has_pattern = pattern_matches.get(candidate.lower()) is not None
 
-            # Frequency weight (25%)
             freq_score = min(freq / max_freq, 1.0) * 0.25
-
-            # Capitalization weight (25%)
             caps_score = min(caps / max_caps, 1.0) * 0.25
-
-            # Structural context weight (35%)
-            pattern_score = 1.0 * 0.35 if has_pattern else 0.0
-
-            # Length bonus (15%) - prefer multi-word terms
+            pattern_score = 0.35 if has_pattern else 0.0
             word_count = len(candidate.split())
             length_score = min(word_count / 3, 1.0) * 0.15
-
             confidence = freq_score + caps_score + pattern_score + length_score
 
-            # Get context sentence for the term
-            context = self._find_context_sentence(candidate, text)
+            context = self._find_context_sentence(candidate)
 
             scored.append(
                 CandidateTerm(
                     term=candidate,
                     confidence=confidence,
                     frequency=freq,
-                    context_pattern=pattern_matches.get(candidate),
+                    context_pattern=pattern_matches.get(candidate.lower()),
                     context_snippet=context,
                 )
             )
