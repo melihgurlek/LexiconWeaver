@@ -69,12 +69,6 @@ class MainScreen(Screen):
         margin: 1;
         width: 1fr;
     }
-
-    #status_bar {
-        height: 1;
-        dock: bottom;
-        background: $panel;
-    }
     """
 
     def __init__(
@@ -100,6 +94,9 @@ class MainScreen(Screen):
         self._candidate_terms: set[str] = set()
         self._cache = get_cache()
         self._smart_scout_running = False
+        self._scout_running = False
+        self._status_message: str = "Ready | r: Scout | s: Smart Scout | t: Translate"
+        self._spinner_index: int = 0
 
     def compose(self):
         """Compose the screen widgets."""
@@ -116,12 +113,13 @@ class MainScreen(Screen):
                     id="candidate_search",
                 )
                 yield CandidateList(id="candidate_list")
-        yield Static("Ready | r: Scout | s: Smart Scout | t: Translate", id="status_bar")
         yield Footer()
 
     def on_mount(self) -> None:
         """Called when the screen is mounted."""
         logger.debug("MainScreen mounted, deferring initialization until widgets are ready")
+        # Start a small timer to animate status when background tasks are running
+        self.set_interval(0.2, self._tick_status_indicator)
         self.call_after_refresh(self._initialize_screen)
 
     def _initialize_screen(self) -> None:
@@ -216,19 +214,41 @@ class MainScreen(Screen):
 
     def action_run_scout(self) -> None:
         """Run the Scout to find candidate terms."""
+        if self._scout_running:
+            self._safe_update_status("Scout is already running...")
+            logger.debug("Scout run requested while already running")
+            return
+
         if self._scout is None:
             self._safe_update_status("Scout not initialized")
             logger.warning("Scout not initialized when run_scout was called")
             return
 
+        if not self._text:
+            self._safe_update_status("No text to analyze")
+            return
+
+        self._scout_running = True
         self._safe_update_status("Running Scout...")
-        logger.debug("Running Scout engine")
+        logger.debug("Scheduling Scout engine run in background task")
+
+        # Run Scout in a background task to keep the TUI responsive
+        asyncio.create_task(self._run_scout_async())
+
+    async def _run_scout_async(self) -> None:
+        """Run the Scout engine asynchronously in a worker thread."""
         try:
-            self._candidates = self._scout.process(self._text)
+            loop = asyncio.get_running_loop()
+
+            # Heavy text processing happens off the UI thread
+            candidates = await loop.run_in_executor(None, self._scout.process, self._text)
+            self._candidates = candidates
             self._candidate_terms = {c.term for c in self._candidates}
             self._refined_terms = []  # Clear any refined terms
 
-            terms_with_translations = self._get_terms_with_translations([c.term for c in self._candidates])
+            terms_with_translations = self._get_terms_with_translations(
+                [c.term for c in self._candidates]
+            )
 
             candidate_list = self.query_one("#candidate_list", CandidateList)
             candidate_list.set_candidates(self._candidates, terms_with_translations)
@@ -239,6 +259,40 @@ class MainScreen(Screen):
         except Exception as e:
             logger.exception("Scout error", error=str(e))
             self._safe_update_status(f"Scout error: {e}")
+        finally:
+            self._scout_running = False
+
+    def _tick_status_indicator(self) -> None:
+        """Periodic timer to update spinner / subtitle in the header."""
+        # Determine current activity
+        if self._smart_scout_running:
+            prefix = self._spinner_prefix("Smart Scout")
+        elif self._scout_running:
+            prefix = self._spinner_prefix("Scout")
+        else:
+            # No background activity; just show the message
+            self._update_header_subtitle(self._status_message)
+            return
+
+        self._update_header_subtitle(f"{prefix} {self._status_message}")
+
+    def _spinner_prefix(self, label: str) -> str:
+        """Return a simple spinner prefix (plain text, no markup)."""
+        frames = ["|", "/", "-", "\\"]
+        self._spinner_index = (self._spinner_index + 1) % len(frames)
+        # Use plain characters only to avoid Textual markup parsing issues
+        return f"{frames[self._spinner_index]} {label} running..."
+
+    def _update_header_subtitle(self, message: str) -> None:
+        """Update the TUI header subtitle so status is always visible."""
+        try:
+            # LexiconWeaverApp defines TITLE / SUB_TITLE; we can tweak sub_title at runtime
+            if hasattr(self.app, "sub_title"):
+                # type: ignore[attr-defined]
+                self.app.sub_title = message  # textual will redraw the header automatically
+        except Exception:
+            # If for some reason we can't touch the header, just ignore; logging already handled elsewhere
+            pass
 
     def action_run_smart_scout(self) -> None:
         """Run the Smart Scout (two-pass with LLM refinement)."""
@@ -321,12 +375,9 @@ class MainScreen(Screen):
 
     def _safe_update_status(self, message: str) -> None:
         """Update the status bar safely."""
-        try:
-            status_bar = self.query_one("#status_bar", Static)
-            status_bar.update(message)
-            logger.debug("Status updated", message=message)
-        except Exception as e:
-            logger.debug("Could not update status bar", message=message, error=str(e))
+        self._status_message = message
+        self._update_header_subtitle(message)
+        logger.debug("Status updated", message=message)
 
     def on_candidate_list_selected(self, message: CandidateList.Selected) -> None:
         """Handle candidate selection."""

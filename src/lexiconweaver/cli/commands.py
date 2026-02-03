@@ -658,11 +658,17 @@ def translate(
 def tui(
     file: Optional[Path] = typer.Argument(None, help="Text, EPUB, or PDF file to open"),
     project_name: Optional[str] = typer.Option(None, "--project", "-p", help="Project name"),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        "-v",
+        help="Show logs in console while running the TUI",
+    ),
 ):
     """Launch the Textual TUI interface."""
     try:
         config = get_config()
-        configure_logging(config, quiet=True)
+        configure_logging(config, quiet=not verbose)
         initialize_database(config)
 
         project = get_project(project_name)
