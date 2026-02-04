@@ -7,9 +7,9 @@ from textual.message import Message
 from textual.widgets import Button, Input, Label, Select, Static
 
 EXPORT_FORMATS = [
-    ("txt", "TXT (plain text)"),
-    ("pdf", "PDF"),
-    ("epub", "EPUB"),
+    ("TXT (plain text)", "txt"),
+    ("PDF", "pdf"),
+    ("EPUB", "epub"),
 ]
 
 
@@ -126,6 +126,18 @@ class ExportModal(Container):
         if fmt:
             new_path = self._path_for_format(fmt)
             self._path_input.value = str(new_path)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        """Treat Enter in the path input as confirming export."""
+        if event.input.id != "export_path" or not self._path_input:
+            return
+        # Reuse the same logic as pressing the Export button
+        path = Path(self._path_input.value.strip())
+        if not path.suffix:
+            ext = self._format_select.value if self._format_select else "txt"
+            path = path.with_suffix(f".{ext}")
+        self.post_message(self.ExportRequested(path))
+        self.remove()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         """Handle button presses."""

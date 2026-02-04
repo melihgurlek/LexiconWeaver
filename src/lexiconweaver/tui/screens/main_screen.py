@@ -115,6 +115,11 @@ class MainScreen(Screen):
                 yield CandidateList(id="candidate_list")
         yield Footer()
 
+    def action_quit(self) -> None:
+        """Quit the TUI application from the main screen."""
+        if hasattr(self.app, "action_quit"):
+            self.app.action_quit()
+
     def on_mount(self) -> None:
         """Called when the screen is mounted."""
         logger.debug("MainScreen mounted, deferring initialization until widgets are ready")
