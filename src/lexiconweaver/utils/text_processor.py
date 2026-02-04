@@ -54,6 +54,40 @@ def extract_ngrams(text: str, n: int, min_length: int = 2) -> Iterator[tuple[str
             yield (ngram, i)
 
 
+def _split_oversized_paragraph(paragraph: str, max_chars: int) -> list[str]:
+    """Split an oversized paragraph into chunks at sentence boundaries."""
+    # Split after sentence-ending punctuation, preserving it with the sentence
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", paragraph) if s.strip()]
+    if not sentences:
+        # No sentence boundaries found: hard split by character limit
+        return [paragraph[i : i + max_chars] for i in range(0, len(paragraph), max_chars)]
+
+    result: list[str] = []
+    current: list[str] = []
+    current_len = 0
+
+    for sent in sentences:
+        sent_len = len(sent) + (1 if current else 0)
+        if current_len + sent_len > max_chars and current:
+            result.append(" ".join(current))
+            current = []
+            current_len = 0
+        if len(sent) > max_chars:
+            if current:
+                result.append(" ".join(current))
+                current = []
+                current_len = 0
+            for i in range(0, len(sent), max_chars):
+                result.append(sent[i : i + max_chars])
+            continue
+        current.append(sent)
+        current_len += sent_len
+
+    if current:
+        result.append(" ".join(current))
+    return result
+
+
 def batch_paragraphs_smart(
     text: str, max_chars: int = 2000, context_sentences: int = 2
 ) -> list[str]:
@@ -74,7 +108,7 @@ def batch_paragraphs_smart(
     paragraphs = extract_paragraphs(text)
     if not paragraphs:
         return []
-    
+
     batches: list[str] = []
     current_batch: list[str] = []
     current_length = 0
@@ -82,16 +116,15 @@ def batch_paragraphs_smart(
     for paragraph in paragraphs:
         para_length = len(paragraph)
         
-        # If a single paragraph exceeds max_chars, we still need to include it
-        # but we'll add it as its own batch
+
         if para_length > max_chars:
             if current_batch:
                 batches.append("\n\n".join(current_batch))
                 current_batch = []
                 current_length = 0
-            
-            # Add the oversized paragraph as its own batch
-            batches.append(paragraph)
+
+            sub_batches = _split_oversized_paragraph(paragraph, max_chars)
+            batches.extend(sub_batches)
             continue
         
         # Check if adding this paragraph would exceed the limit
@@ -108,5 +141,5 @@ def batch_paragraphs_smart(
     
     if current_batch:
         batches.append("\n\n".join(current_batch))
-    
+
     return batches if batches else [text]
