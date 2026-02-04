@@ -131,7 +131,6 @@ class ExportModal(Container):
         """Treat Enter in the path input as confirming export."""
         if event.input.id != "export_path" or not self._path_input:
             return
-        # Reuse the same logic as pressing the Export button
         path = Path(self._path_input.value.strip())
         if not path.suffix:
             ext = self._format_select.value if self._format_select else "txt"
