@@ -28,28 +28,38 @@ def _get_unicode_font_path() -> Path | None:
         search_dirs.append(Path(windir) / "Fonts")
     else:
         search_dirs.extend([
+            Path("/usr/share/fonts/google-noto-vf"),
             Path("/usr/share/fonts/google-noto-sans"),
+            Path("/usr/share/fonts/google-noto"),
             Path("/usr/share/fonts/noto"),
             Path("/usr/share/fonts/truetype/noto"),
             Path("/usr/share/fonts/TTF"),
             Path.home() / ".local" / "share" / "fonts",
         ])
 
-    font_names = ("NotoSans-Regular.ttf", "NotoSans.ttf", "DejaVuSans.ttf", "NotoSans-VariableFont_wdth,wght.ttf")
-    
+    font_names = (
+        "NotoSans[wght].ttf",
+        "NotoSans-Regular.ttf",
+        "NotoSans.ttf",
+        "DejaVuSans.ttf",
+        "NotoSans-VariableFont_wdth,wght.ttf",
+    )
+
     for directory in search_dirs:
         if not directory.is_dir():
             continue
-            
+
         for name in font_names:
             path = directory / name
             if path.is_file():
                 return path
-                
+
         for child in directory.rglob("*.ttf"):
             if child.name in font_names:
                 return child
-                
+            if child.stem in ("NotoSans", "NotoSans-Regular"):
+                return child
+
     return None
 
 

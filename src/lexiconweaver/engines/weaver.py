@@ -213,7 +213,8 @@ class Weaver(BaseEngine):
             term_map[source_term.lower()] = target_term
 
         match_text = text.replace("\u00a0", " ")
-        found_terms = keyword_processor.extract_keywords(match_text)
+        found_list = keyword_processor.extract_keywords(match_text)
+        found_terms: set[str] = set(found_list) if found_list else set()
         
         text_lower = match_text.lower()
         for source_term_lower, target_term in term_map.items():
@@ -225,7 +226,7 @@ class Weaver(BaseEngine):
                         break
         
         mini_glossary: dict[str, str] = {}
-        for found_term in dict.fromkeys(found_terms):
+        for found_term in found_terms:
             target = term_map.get(found_term.lower())
             if target:
                 mini_glossary[found_term] = target
