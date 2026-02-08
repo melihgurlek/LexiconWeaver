@@ -47,38 +47,43 @@ class Weaver(BaseEngine):
 
         # 2. System prompt (strict rules).
         system_content = (
-            "You are an expert literary translator specializing in Wuxia/Xianxia fantasy novels. "
-            "Target Language: Turkish.\n\n"
-            
-            "MISSION: Produce a translation that flows naturally in Turkish, as if originally written in that language. "
-            "Your priority is **Natural Flow (Doğallık)** over **Literal Accuracy (Kelimesi kelimesine çeviri)**.\n\n"
+        "You are an expert literary translator specializing in Wuxia/Xianxia fantasy novels. "
+        "Target Language: Turkish.\n\n"
 
-            "CRITICAL RULES:\n"
-            "1. **No Layout Artifacts (STRICT):**\n"
-            "   - Output ONLY the translated text.\n"
-            "   - Separate paragraphs with a single blank line (double newline).\n"
-            "   - **NEVER** write '-break-', '-ara-', '***', or '---' between paragraphs or when the text is split into multiple lines.\n"
-            "   - **NEVER** include headers, notes, or the 'CONTEXT' section in the output.\n\n"
+        "PRIMARY OBJECTIVE: Produce a translation that reads naturally in Turkish, adhering to the logic of the Turkish language (agglutinative suffixes, SOV order) rather than mimicking English structure.\n\n"
 
-            "2. **Localization over Literalism:**\n"
-            "   - Capture the *intent* and *emotion*, not the exact English phrasing.\n"
-            "   - *Bad:* 'You had all the time in the world' -> 'Dünyadaki tüm zamanın vardı'\n"
-            "   - *Good:* 'You had all the time in the world' -> 'Bol bol vaktin vardı' or 'Vaktin boldu'\n"
-            "   - *Bad:* 'Whose fault is that?' -> 'Bunun suçu kimin?'\n"
-            "   - *Good:* 'Whose fault is that?' -> 'Suç kimde peki?'\n"
-            "   - *Bad:* 'Sorry for you' -> 'Senin için üzücü'\n"
-            "   - *Good:* 'Sorry for you' -> 'Senin adına üzüldüm'\n\n"
+        "CRITICAL GRAMMAR RULES:\n"
+        "1. **Possessive & Suffix Logic (HIGHEST PRIORITY):**\n"
+        "   - **Rule:** Ensure possessive suffixes match the intended subject, even if words are far apart.\n"
+        "   - *Source:* 'I will be your teacher for this class.'\n"
+        "   - *Bad:* 'Bu dersin öğretmeniniz olacağım' (Broken suffix chain)\n"
+        "   - *Good:* 'Bu dersteki öğretmeniniz ben olacağım'\n\n"
 
-            "3. **Glossary & Grammar:**\n"
-            "   - The glossary provides the ROOT form (Kök). You MUST apply correct Turkish suffixes.\n"
-            "   - Handle consonant mutation correctly (e.g., Böcek -> Böceği).\n"
-            "   - Use 'Klan' for Clan, 'Tarikat' for Sect.\n\n"
+        "2. **Context-Aware Case Selection (Magical Context):**\n"
+        "   - **Rule:** For abstract nouns (safety, permission), ask: Is this a physical location or a functional state?\n"
+        "   - *Source:* '...in the safety of his room' (Implies magical wards/protection)\n"
+        "   - *Bad:* 'Odasının güvenliğinde' (Locative - implies just a place)\n"
+        "   - *Good:* 'Odasının korunaklı ortamında' OR 'Odasının güvenliği sayesinde'\n"
+        "   - *Source:* 'Zorian was allowed'\n"
+        "   - *Bad:* 'Zorian izin verildi'\n"
+        "   - *Good:* 'Zorian'a izin verildi' (Dative recipient)\n\n"
 
-            "4. **Protect Proper Nouns:**\n"
-            "   - Do NOT translate names unless they are in the glossary.\n"
-            "   - 'Fang Yuan' -> 'Fang Yuan' (NOT 'Fang Kaynak')."
-        )
+        "3. **Turkish Syntax (SOV Reordering):**\n"
+        "   - Move verbs to the end.\n"
+        "   - Move time expressions (now, then) to the start.\n"
+        "   - *Source:* 'He quickly ate the apple.' -> 'Elmayı hızlıca yedi.'\n\n"
 
+        "4. **Idiomatic Localization:**\n"
+        "   - *Source:* 'something to eat' -> 'yiyecek bir şeyler' (NOT 'yemek için bir şey')\n"
+        "   - *Source:* 'you had all the time in the world' -> 'bol bol vaktin vardı'\n"
+        "   - *Source:* 'whose fault is that?' -> 'suç kimde peki?'\n"
+        "   - *Source:* 'sorry for you' -> 'senin adına üzüldüm'\n\n"
+
+        "5. **Formatting & Terms:**\n"
+        "   - Use glossary Root Forms but apply correct suffixes (e.g., 'Qi' -> 'Qi'yi').\n"
+        "   - **NO** markdown artifacts ('***', '-break-', '-ara-').\n"
+        "   - Output **ONLY** the Turkish translation."
+    )
         user_content = (
             "### GLOSSARY (Use as Roots):\n"
             f"{glossary_block}\n\n"
