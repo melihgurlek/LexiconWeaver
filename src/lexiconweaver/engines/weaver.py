@@ -80,9 +80,10 @@ class Weaver(BaseEngine):
         "   - *Source:* 'sorry for you' -> 'senin adına üzüldüm'\n\n"
 
         "5. **Formatting & Terms:**\n"
+        "   - **START IMMEDIATELY:** Do not repeat the input headers ('### SÖZLÜK', '### BAĞLAM', etc.).\n"
         "   - Use glossary Root Forms but apply correct suffixes (e.g., 'Qi' -> 'Qi'yi').\n"
         "   - **NO** markdown artifacts ('***', '-break-', '-ara-').\n"
-        "   - Output **ONLY** the Turkish translation."
+        "   - Output **ONLY** the Turkish translation. If you output headers, you FAIL."
     )
         user_content = (
             "### GLOSSARY (Use as Roots):\n"
