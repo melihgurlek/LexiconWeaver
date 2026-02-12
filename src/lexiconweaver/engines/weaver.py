@@ -1,7 +1,8 @@
 """Weaver engine for LLM-based translation with glossary enforcement."""
 
 import asyncio
-from typing import AsyncIterator
+from dataclasses import dataclass
+from typing import AsyncIterator, Optional
 
 from flashtext import KeywordProcessor
 from peewee import IntegrityError
@@ -12,9 +13,19 @@ from lexiconweaver.engines.base import BaseEngine
 from lexiconweaver.exceptions import ProviderError, TranslationError
 from lexiconweaver.logging_config import get_logger
 from lexiconweaver.providers import LLMProviderManager
-from lexiconweaver.utils.text_processor import extract_paragraphs, generate_hash
+from lexiconweaver.utils.text_processor import extract_paragraphs, generate_hash, split_into_sentences
 
 logger = get_logger(__name__)
+
+
+@dataclass
+class TranslatedChapter:
+    """Result of chapter translation."""
+    
+    number: int
+    title: str
+    content: str
+    source_filename: str
 
 
 class Weaver(BaseEngine):
@@ -215,6 +226,280 @@ class Weaver(BaseEngine):
                 translated_paragraphs.append(f"[ERROR] {paragraph}")
 
         return "\n\n".join(translated_paragraphs)
+
+    async def translate_chapter(
+        self,
+        text: str,
+        chapter_num: int,
+        extract_title: bool = False,
+        source_filename: str = ""
+    ) -> TranslatedChapter:
+        """
+        Translate a complete chapter with optional title extraction.
+        
+        Args:
+            text: Chapter text to translate
+            chapter_num: Chapter number
+            extract_title: If True, extract chapter title from first batch
+            source_filename: Original filename for reference
+            
+        Returns:
+            TranslatedChapter with title and translated content
+        """
+        from lexiconweaver.utils.text_processor import batch_paragraphs_smart
+        
+        max_chars = self.config.weaver.translation_batch_max_chars
+        context_sentences = self.config.weaver.translation_context_sentences
+        batches = batch_paragraphs_smart(text, max_chars, context_sentences)
+        
+        if not batches:
+            logger.warning(f"Chapter {chapter_num} produced no batches")
+            return TranslatedChapter(
+                number=chapter_num,
+                title=f"Chapter {chapter_num}",
+                content="",
+                source_filename=source_filename
+            )
+        
+        logger.info(f"Translating chapter {chapter_num}", batches=len(batches))
+        
+        title = None
+        translated_batches = []
+        previous_context = ""
+        
+        for batch_idx, batch in enumerate(batches, 1):
+            if not batch or not batch.strip():
+                continue
+            
+            logger.debug(f"Translating batch {batch_idx}/{len(batches)} of chapter {chapter_num}")
+            
+            if batch_idx == 1 and extract_title:
+                title, translation = await self._translate_batch_with_title_extraction(
+                    batch, chapter_num
+                )
+            else:
+                mini_glossary = self._build_mini_glossary(batch)
+                messages = self._prepare_messages(batch, mini_glossary, previous_context)
+                
+                try:
+                    translation = await self.provider_manager.generate(messages)
+                except ProviderError as e:
+                    raise TranslationError(
+                        f"Translation failed for chapter {chapter_num}, batch {batch_idx}: {e.message}",
+                        details=f"Provider: {e.provider}"
+                    ) from e
+                
+                self._verify_translation(batch, translation, mini_glossary)
+            
+            translated_batches.append(translation)
+            
+            if translation:
+                context_sentences_list = split_into_sentences(translation)
+                if context_sentences_list and len(context_sentences_list) >= context_sentences:
+                    previous_context = "\n\n".join(context_sentences_list[-context_sentences:])
+                else:
+                    context_length = min(200, len(translation))
+                    previous_context = translation[-context_length:] if translation else ""
+        
+        if not title:
+            title = f"Chapter {chapter_num}"
+        
+        content = "\n\n".join(translated_batches)
+        
+        return TranslatedChapter(
+            number=chapter_num,
+            title=title,
+            content=content,
+            source_filename=source_filename
+        )
+    
+    async def _translate_batch_with_title_extraction(
+        self, batch: str, chapter_num: int
+    ) -> tuple[str, str]:
+        """
+        Translate first batch and extract chapter title using metadata header format.
+        
+        Args:
+            batch: Text batch to translate
+            chapter_num: Chapter number for fallback
+            
+        Returns:
+            Tuple of (title, translation)
+        """
+        mini_glossary = self._build_mini_glossary(batch)
+        
+        messages = self._prepare_messages_with_title_extraction(
+            batch, mini_glossary, chapter_num
+        )
+        
+        try:
+            response = await self.provider_manager.generate(messages)
+        except ProviderError as e:
+            raise TranslationError(
+                f"Title extraction failed: {e.message}",
+                details=f"Provider: {e.provider}"
+            ) from e
+        
+        title, translation = self._extract_title_and_translation(response, chapter_num)
+        
+        self._verify_translation(batch, translation, mini_glossary)
+        
+        return title, translation
+    
+    def _prepare_messages_with_title_extraction(
+        self, text: str, mini_glossary: dict[str, str], chapter_num: int
+    ) -> list[dict[str, str]]:
+        """Prepare messages with title extraction instruction."""
+        glossary_block = "No specific terms."
+        if mini_glossary:
+            glossary_lines = [
+                f"- {src} -> {tgt}" for src, tgt in mini_glossary.items()
+            ]
+            glossary_block = "\n".join(glossary_lines)
+        
+        system_content = (
+            "You are an expert literary translator specializing in Wuxia/Xianxia fantasy novels. "
+            "Target Language: Turkish.\n\n"
+            
+            "PRIMARY OBJECTIVE: Produce a translation that reads naturally in Turkish, adhering to the logic of the Turkish language (agglutinative suffixes, SOV order) rather than mimicking English structure.\n\n"
+            
+            "CRITICAL GRAMMAR RULES:\n"
+            "1. **Possessive & Suffix Logic (HIGHEST PRIORITY):**\n"
+            "   - **Rule:** Ensure possessive suffixes match the intended subject, even if words are far apart.\n"
+            "   - *Source:* 'I will be your teacher for this class.'\n"
+            "   - *Bad:* 'Bu dersin öğretmeniniz olacağım' (Broken suffix chain)\n"
+            "   - *Good:* 'Bu dersteki öğretmeniniz ben olacağım'\n\n"
+            
+            "2. **Context-Aware Case Selection (Magical Context):**\n"
+            "   - **Rule:** For abstract nouns (safety, permission), ask: Is this a physical location or a functional state?\n"
+            "   - *Source:* '...in the safety of his room' (Implies magical wards/protection)\n"
+            "   - *Bad:* 'Odasının güvenliğinde' (Locative - implies just a place)\n"
+            "   - *Good:* 'Odasının korunaklı ortamında' OR 'Odasının güvenliği sayesinde'\n"
+            "   - *Source:* 'Zorian was allowed'\n"
+            "   - *Bad:* 'Zorian izin verildi'\n"
+            "   - *Good:* 'Zorian'a izin verildi' (Dative recipient)\n\n"
+            
+            "3. **Turkish Syntax (SOV Reordering):**\n"
+            "   - Move verbs to the end.\n"
+            "   - Move time expressions (now, then) to the start.\n"
+            "   - *Source:* 'He quickly ate the apple.' -> 'Elmayı hızlıca yedi.'\n\n"
+            
+            "4. **Idiomatic Localization:**\n"
+            "   - *Source:* 'something to eat' -> 'yiyecek bir şeyler' (NOT 'yemek için bir şey')\n"
+            "   - *Source:* 'you had all the time in the world' -> 'bol bol vaktin vardı'\n"
+            "   - *Source:* 'whose fault is that?' -> 'suç kimde peki?'\n"
+            "   - *Source:* 'sorry for you' -> 'senin adına üzüldüm'\n\n"
+            
+            "5. **Formatting & Terms:**\n"
+            "   - Use glossary Root Forms but apply correct suffixes (e.g., 'Qi' -> 'Qi'yi').\n"
+            "   - **NO** markdown artifacts ('***', '-break-', '-ara-').\n"
+        )
+        
+        user_content = (
+            "### ADDITIONAL TASK (CRITICAL): This is the beginning of a chapter. Extract the chapter title from the first line/heading.\n"
+            "Output format:\n"
+            "TITLE: [Extracted Chapter Title]\n"
+            "---\n"
+            "[Translation text here]\n\n"
+            
+            f"If no clear title exists, use \"Chapter {chapter_num}\" as the title.\n"
+            "CRITICAL: Start with \"TITLE:\" on the first line, then \"---\" separator, then the translation.\n\n"
+            
+            "### GLOSSARY (Use as Roots):\n"
+            f"{glossary_block}\n\n"
+            
+            "### CURRENT CHUNK (TRANSLATE THIS):\n"
+            f"{text}\n"
+        )
+        
+        return [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": user_content},
+        ]
+    
+    def _extract_title_and_translation(
+        self, llm_response: str, chapter_num: int
+    ) -> tuple[str, str]:
+        """
+        Extract title and translation from metadata header format.
+        
+        Args:
+            llm_response: LLM response with TITLE:/--- format
+            chapter_num: Chapter number for fallback
+            
+        Returns:
+            Tuple of (title, translation)
+        """
+        lines = llm_response.strip().split('\n')
+        
+        title = ""
+        translation_lines = []
+        found_separator = False
+        
+        for i, line in enumerate(lines[:5]):
+            if line.startswith("TITLE:"):
+                title = line[6:].strip()
+            elif line.strip() == "---":
+                found_separator = True
+                translation_lines = lines[i+1:]
+                break
+        
+        if not found_separator:
+            logger.warning("No TITLE/--- separator found, treating as plain translation")
+            translation_lines = lines
+        
+        if not title:
+            title = f"Chapter {chapter_num}"
+            logger.info(f"No title found, using fallback: {title}")
+        
+        translation = '\n'.join(translation_lines).strip()
+        return title, translation
+    
+    async def translate_chapters_parallel(
+        self,
+        chapters: list[tuple[str, int, str]],
+        max_concurrency: int = 5,
+        extract_titles: bool = True
+    ) -> list[TranslatedChapter]:
+        """
+        Translate multiple chapters in parallel with rate limiting.
+        
+        Args:
+            chapters: List of (text, chapter_num, filename) tuples
+            max_concurrency: Maximum concurrent translations (default: 5)
+            extract_titles: Whether to extract chapter titles (default: True)
+            
+        Returns:
+            List of TranslatedChapter objects
+        """
+        semaphore = asyncio.Semaphore(max_concurrency)
+        
+        async def translate_with_semaphore(
+            text: str, chapter_num: int, filename: str
+        ) -> TranslatedChapter:
+            async with semaphore:
+                logger.info(f"Starting chapter {chapter_num}")
+                result = await self.translate_chapter(
+                    text, chapter_num, extract_title=extract_titles, source_filename=filename
+                )
+                await asyncio.sleep(0.1)
+                return result
+        
+        tasks = [
+            translate_with_semaphore(text, num, filename)
+            for text, num, filename in chapters
+        ]
+        
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        translated_chapters = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                logger.error(f"Chapter {chapters[i][1]} translation failed", error=str(result))
+            else:
+                translated_chapters.append(result)
+        
+        return translated_chapters
 
     def _build_mini_glossary(self, text: str) -> dict[str, str]:
         """Build a mini-glossary containing only terms that appear in the text."""

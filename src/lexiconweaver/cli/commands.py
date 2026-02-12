@@ -20,6 +20,7 @@ from lexiconweaver.database import (
     initialize_database,
 )
 from lexiconweaver.database.models import ProposedTerm
+from lexiconweaver.engines.batch_manager import BatchManager, BatchProgress
 from lexiconweaver.engines.scout import Scout
 from lexiconweaver.engines.scout_refiner import ScoutRefiner
 from lexiconweaver.engines.weaver import Weaver
@@ -649,6 +650,129 @@ def translate(
     except Exception as e:
         console.print(f"[red]Unexpected error: {e}[/red]")
         logger.exception("Translate command failed")
+        raise typer.Exit(1)
+    finally:
+        close_database()
+
+
+@app.command(name="batch-translate")
+def batch_translate(
+    workspace: Path = typer.Argument(..., help="Workspace directory (contains input/, output/, merged/ folders)"),
+    project_name: str = typer.Option(..., "--project", "-p", help="Project name for glossary"),
+    output_format: str = typer.Option("epub", "--format", "-f", help="Output format: txt, pdf, or epub"),
+    scout_first: bool = typer.Option(True, "--scout/--no-scout", help="Run global scout before translation"),
+    max_parallel: int = typer.Option(5, "--parallel", help="Maximum parallel chapters (1-20)"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Calculate costs without translating"),
+    resume: bool = typer.Option(True, "--resume/--no-resume", help="Skip already-translated chapters"),
+    mode: str = typer.Option("full", "--mode", help="Mode: full, scout_only, or translate_only"),
+):
+    """
+    Batch translate multiple chapters with parallel processing.
+    
+    Workflow:
+    1. Discovers chapters in workspace/input/
+    2. Optionally runs global scout for term discovery
+    3. Translates chapters in parallel with checkpointing
+    4. Merges chapters into workspace/merged/complete.{format}
+    
+    Examples:
+        # Dry run to estimate costs
+        lexiconweaver batch-translate ./my-novel --project "MyNovel" --dry-run
+        
+        # Full translation with scouting
+        lexiconweaver batch-translate ./my-novel --project "MyNovel" --format epub
+        
+        # Resume interrupted translation
+        lexiconweaver batch-translate ./my-novel --project "MyNovel" --resume
+        
+        # Translate only (skip scouting)
+        lexiconweaver batch-translate ./my-novel --project "MyNovel" --no-scout
+    """
+    try:
+        config = get_config()
+        configure_logging(config)
+        initialize_database(config)
+        
+        if max_parallel != 5:
+            config.batch.max_parallel_chapters = max(1, min(20, max_parallel))
+        
+        project = get_project(project_name)
+        
+        batch_manager = BatchManager(config, project, workspace)
+        
+        console.print(f"[bold cyan]Batch Translation Workflow[/bold cyan]")
+        console.print(f"Workspace: {workspace}")
+        console.print(f"Project: {project_name}")
+        console.print(f"Mode: {mode}")
+        console.print(f"Format: {output_format}")
+        console.print(f"Provider: {config.provider.primary}")
+        if config.provider.fallback != "none":
+            console.print(f"Fallback: {config.provider.fallback}")
+        console.print()
+        
+        if dry_run:
+            console.print("[bold yellow]Dry Run Mode - Calculating Costs[/bold yellow]\n")
+            summary = batch_manager.dry_run(provider=config.provider.primary)
+            console.print(summary)
+            
+            if not Confirm.ask("\n[bold]Proceed with translation?[/bold]"):
+                console.print("[yellow]Cancelled by user[/yellow]")
+                raise typer.Exit(0)
+            console.print()
+        
+        current_stage = {"stage": "", "current": 0, "total": 0}
+        
+        def progress_callback(progress: BatchProgress):
+            if progress.stage != current_stage["stage"]:
+                if current_stage["stage"]:
+                    console.print()  # New line between stages
+                current_stage["stage"] = progress.stage
+                console.print(f"[bold blue]{progress.stage.upper()} STAGE[/bold blue]")
+            
+            current_stage["current"] = progress.current
+            current_stage["total"] = progress.total
+            console.print(f"  [{progress.current}/{progress.total}] {progress.message}")
+        
+        console.print("[bold green]Starting Batch Processing...[/bold green]\n")
+        
+        results = asyncio.run(
+            batch_manager.process_folder(
+                mode=mode,
+                resume=resume,
+                progress_callback=progress_callback
+            )
+        )
+        
+        console.print("\n[bold green]✓ Batch Processing Complete![/bold green]\n")
+        
+        results_table = Table(title="Results Summary")
+        results_table.add_column("Metric", style="cyan")
+        results_table.add_column("Value", style="green")
+        
+        results_table.add_row("Chapters Found", str(results["chapters_found"]))
+        if mode in ["full", "scout_only"]:
+            results_table.add_row("Chapters Scouted", str(results["chapters_scouted"]))
+            results_table.add_row("Terms Discovered", str(results["terms_discovered"]))
+        if mode in ["full", "translate_only"]:
+            results_table.add_row("Chapters Translated", str(results["chapters_translated"]))
+            if results.get("chapters_skipped", 0) > 0:
+                results_table.add_row("Chapters Skipped (Resume)", str(results["chapters_skipped"]))
+            if results["merged_output"]:
+                results_table.add_row("Merged Output", results["merged_output"])
+        
+        console.print(results_table)
+        
+        if mode == "scout_only":
+            console.print("\n[yellow]Note:[/yellow] Scout complete. Review and approve terms, then run with --mode translate_only")
+        
+    except LexiconWeaverError as e:
+        console.print(f"\n[red]Error: {e.message}[/red]")
+        if hasattr(e, 'details') and e.details:
+            console.print(f"[dim]{e.details}[/dim]")
+        raise typer.Exit(1)
+    except Exception as e:
+        console.print(f"\n[red]Unexpected error: {e}[/red]")
+        logger.exception("Batch translate command failed")
         raise typer.Exit(1)
     finally:
         close_database()

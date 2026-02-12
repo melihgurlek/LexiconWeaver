@@ -138,6 +138,62 @@ class WeaverConfig(BaseSettings):
     )
 
 
+class BatchConfig(BaseSettings):
+    """Configuration for batch translation workflow."""
+
+    model_config = SettingsConfigDict(extra="allow")
+
+    max_parallel_chapters: int = Field(
+        default=5, ge=1, le=20, description="Maximum chapters to translate in parallel"
+    )
+    max_parallel_batches: int = Field(
+        default=1, ge=1, le=10, description="Maximum batches per chapter in parallel (future)"
+    )
+    
+    rate_limit_rpm: int = Field(
+        default=60, ge=1, description="Estimated API rate limit (requests per minute)"
+    )
+    rate_limit_backoff_base: int = Field(
+        default=2, ge=2, le=10, description="Exponential backoff base (2^attempt seconds)"
+    )
+    rate_limit_max_wait: int = Field(
+        default=60, ge=10, le=300, description="Maximum wait time for rate limit backoff (seconds)"
+    )
+    
+    scout_min_frequency: int = Field(
+        default=3, ge=1, description="Minimum frequency for term candidates"
+    )
+    scout_burst_threshold: int = Field(
+        default=5, ge=1, description="Minimum frequency in window for burst detection"
+    )
+    scout_burst_window_size: int = Field(
+        default=3, ge=1, le=10, description="Sliding window size for burst detection"
+    )
+    scout_llm_refine_top_percent: int = Field(
+        default=20, ge=1, le=100, description="Percentage of top candidates to refine with LLM"
+    )
+    
+    extract_chapter_titles: bool = Field(
+        default=True, description="Extract chapter titles from content"
+    )
+    fallback_to_filename: bool = Field(
+        default=True, description="Use filename as fallback if title extraction fails"
+    )
+    
+    input_folder: str = Field(
+        default="input", description="Input folder for raw chapters"
+    )
+    output_folder: str = Field(
+        default="output", description="Output folder for translated chapters"
+    )
+    merged_folder: str = Field(
+        default="merged", description="Folder for merged output files"
+    )
+    metadata_folder: str = Field(
+        default=".weavecodex", description="Folder for metadata and cache"
+    )
+
+
 class Config(BaseSettings):
     """Main configuration class."""
 
@@ -155,6 +211,7 @@ class Config(BaseSettings):
     cache: CacheConfig = Field(default_factory=CacheConfig)
     scout: ScoutConfig = Field(default_factory=ScoutConfig)
     weaver: WeaverConfig = Field(default_factory=WeaverConfig)
+    batch: BatchConfig = Field(default_factory=BatchConfig)
 
     @classmethod
     def load(cls, config_path: Optional[Path] = None) -> "Config":

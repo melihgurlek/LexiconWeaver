@@ -115,19 +115,22 @@ class DeepSeekProvider(BaseLLMProvider):
                         )
 
                     if response.status_code == 429:
-                        # Rate limited - wait and retry
                         if attempt < self.max_retries:
-                            wait_time = 2 ** (attempt + 1)  # Exponential backoff
+                            wait_time = min(
+                                2 ** (attempt + 1),
+                                60
+                            )
                             logger.warning(
-                                "DeepSeek rate limited, retrying",
                                 attempt=attempt + 1,
+                                max_attempts=self.max_retries + 1,
                                 wait_time=wait_time,
                             )
                             await asyncio.sleep(wait_time)
                             continue
                         else:
                             raise ProviderError(
-                                "DeepSeek API rate limit exceeded after retries",
+                                "DeepSeek API rate limit exceeded after maximum retries. "
+                                "Try reducing max_parallel_chapters in config or wait before retrying.",
                                 provider="deepseek",
                             )
 

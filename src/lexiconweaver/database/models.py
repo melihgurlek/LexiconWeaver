@@ -10,6 +10,7 @@ from peewee import (
     DateTimeField,
     FloatField,
     ForeignKeyField,
+    IntegerField,
     Model,
     TextField,
 )
@@ -108,12 +109,67 @@ class ProposedTerm(BaseModel):
         )
 
 
+class ChapterMetadata(BaseModel):
+    """Metadata for chapters in batch translation workflow.
+    
+    Stores information about chapters for multi-chapter projects,
+    including chapter numbers, titles, and statistics.
+    """
+
+    project = ForeignKeyField(Project, backref="chapters", on_delete="CASCADE")
+    chapter_num = IntegerField(index=True)
+    filename = CharField(max_length=255)
+    title = CharField(max_length=255, null=True)
+    word_count = IntegerField(null=True)
+    char_count = IntegerField(null=True)
+    translated = BooleanField(default=False)
+    created_at = DateTimeField(default=datetime.now)
+    updated_at = DateTimeField(default=datetime.now)
+
+    class Meta:
+        table_name = "chapter_metadata"
+        indexes = (
+            (("project", "chapter_num"), True),
+        )
+
+
+class BurstTerm(BaseModel):
+    """Terms detected by burst detection algorithm.
+    
+    Stores terms that show high local density (sudden frequency spikes)
+    across chapters, indicating important story elements introduced mid-narrative.
+    """
+
+    project = ForeignKeyField(Project, backref="burst_terms", on_delete="CASCADE")
+    term = CharField(max_length=255, index=True)
+    first_chapter = IntegerField()
+    max_window_frequency = IntegerField()
+    global_frequency = IntegerField()
+    density_score = FloatField()
+    status = CharField(max_length=20, default="pending")
+    created_at = DateTimeField(default=datetime.now)
+
+    class Meta:
+        table_name = "burst_terms"
+        indexes = (
+            (("project", "term"), True),
+        )
+
+
 def create_tables() -> None:
     """Create all database tables."""
     if db_proxy.obj is None:
         raise DatabaseError("Database not initialized")
     db_proxy.create_tables(
-        [Project, GlossaryTerm, IgnoredTerm, TranslationCache, ProposedTerm],
+        [
+            Project,
+            GlossaryTerm,
+            IgnoredTerm,
+            TranslationCache,
+            ProposedTerm,
+            ChapterMetadata,
+            BurstTerm,
+        ],
         safe=True,
     )
 
@@ -123,5 +179,13 @@ def drop_tables() -> None:
     if db_proxy.obj is None:
         raise DatabaseError("Database not initialized")
     db_proxy.drop_tables(
-        [Project, GlossaryTerm, IgnoredTerm, TranslationCache, ProposedTerm]
+        [
+            Project,
+            GlossaryTerm,
+            IgnoredTerm,
+            TranslationCache,
+            ProposedTerm,
+            ChapterMetadata,
+            BurstTerm,
+        ]
     )

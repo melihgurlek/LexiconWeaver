@@ -73,3 +73,31 @@ streaming = true
 max_context_tokens = 4096
 translation_batch_max_chars = 3500
 translation_context_sentences = 2
+
+[batch]
+# Maximum chapters to translate in parallel
+max_parallel_chapters = 5
+# Maximum batches to process in parallel within a chapter (future feature)
+max_parallel_batches = 1
+# Estimated API rate limit in requests per minute (for cost estimation)
+rate_limit_rpm = 60
+# Exponential backoff base for rate limit retries (2^attempt seconds)
+rate_limit_backoff_base = 2
+# Maximum wait time for rate limit backoff (seconds)
+rate_limit_max_wait = 60
+
+# Global scout settings for batch term discovery
+scout_min_frequency = 3
+scout_burst_threshold = 5
+scout_burst_window_size = 3
+scout_llm_refine_top_percent = 20
+
+# TOC extraction settings
+extract_chapter_titles = true
+fallback_to_filename = true
+
+# Folder structure settings (relative to workspace root)
+input_folder = "input"
+output_folder = "output"
+merged_folder = "merged"
+metadata_folder = ".weavecodex"

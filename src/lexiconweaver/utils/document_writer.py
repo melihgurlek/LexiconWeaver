@@ -133,8 +133,16 @@ def _write_pdf(path: Path, text: str, title: str = "Translation") -> None:
     pdf.output(str(path))
 
 
-def _write_epub(path: Path, text: str, title: str = "Translation") -> None:
-    """Write EPUB using ebooklib."""
+def _write_epub(path: Path, text: str, title: str = "Translation", chapters: list[tuple[str, str]] | None = None) -> None:
+    """
+    Write EPUB using ebooklib with optional multi-chapter support.
+    
+    Args:
+        path: Output file path
+        text: Content (used if chapters not provided)
+        title: Book title
+        chapters: Optional list of (chapter_title, chapter_content) tuples for multi-chapter EPUB
+    """
     try:
         from ebooklib import epub
     except ImportError as e:
@@ -148,41 +156,138 @@ def _write_epub(path: Path, text: str, title: str = "Translation") -> None:
     book.set_identifier("translation-1")
     book.set_title(title[:255] if title else "Translation")
     book.set_language("en")
-
-    paragraphs = [
-        p.strip()
-        for p in text.replace("\r\n", "\n").replace("\r", "\n").split("\n\n")
-        if p.strip()
-    ]
-    body_parts = [
-        f"<p>{html.escape(p)}</p>" for p in paragraphs
-    ]
     
-    content = (
-        "<!DOCTYPE html><html><head><meta charset='utf-8'/></head>"
-        "<body>\n" + "\n".join(body_parts) + "\n</body></html>"
+    style_css = """
+    .chapter-title {
+        font-size: 1.8em;
+        font-weight: bold;
+        text-align: center;
+        margin: 2em 0 1.5em 0;
+    }
+    .chapter-content {
+        text-align: justify;
+        line-height: 1.6;
+    }
+    p {
+        margin: 0.8em 0;
+        text-indent: 1.5em;
+    }
+    """
+    
+    css = epub.EpubItem(
+        uid="style",
+        file_name="style.css",
+        media_type="text/css",
+        content=style_css.encode('utf-8')
     )
+    book.add_item(css)
+    
+    chapter_objects = []
+    
+    if chapters:
+        for idx, (ch_title, ch_content) in enumerate(chapters, 1):
+            chapter_obj = _create_epub_chapter(
+                idx, ch_title, ch_content, css
+            )
+            book.add_item(chapter_obj)
+            chapter_objects.append(chapter_obj)
+    else:
+        paragraphs = [
+            p.strip()
+            for p in text.replace("\r\n", "\n").replace("\r", "\n").split("\n\n")
+            if p.strip()
+        ]
+        body_parts = [
+            f"<p>{html.escape(p)}</p>" for p in paragraphs
+        ]
+        
+        content = (
+            "<!DOCTYPE html><html><head>"
+            "<meta charset='utf-8'/>"
+            "<link rel='stylesheet' type='text/css' href='style.css'/>"
+            "</head><body>\n"
+            "<div class='chapter-content'>\n" + "\n".join(body_parts) + "\n</div>"
+            "\n</body></html>"
+        )
 
-    chapter = epub.EpubHtml(
-        title=title[:255] if title else "Content",
-        file_name="chapter.xhtml",
-        lang="en",
-    )
-    chapter.content = content
-    book.add_item(chapter)
+        chapter = epub.EpubHtml(
+            title=title[:255] if title else "Content",
+            file_name="chapter.xhtml",
+            lang="en",
+        )
+        chapter.content = content
+        book.add_item(chapter)
+        chapter_objects.append(chapter)
     
     book.add_item(epub.EpubNcx())
     book.add_item(epub.EpubNav())
     
-    book.spine = [chapter]
+    book.spine = ["nav"] + chapter_objects
+    
+    book.toc = chapter_objects
 
     epub.write_epub(str(path), book)
 
 
+def _create_epub_chapter(
+    chapter_num: int,
+    chapter_title: str,
+    chapter_content: str,
+    css
+):
+    """
+    Create a single EPUB chapter with styled title.
+    
+    Args:
+        chapter_num: Chapter number
+        chapter_title: Chapter title
+        chapter_content: Chapter content
+        css: CSS style item (EpubItem)
+        
+    Returns:
+        EpubHtml chapter object
+    """
+    from ebooklib import epub
+    
+    paragraphs = [
+        p.strip()
+        for p in chapter_content.replace("\r\n", "\n").replace("\r", "\n").split("\n\n")
+        if p.strip()
+    ]
+    
+    body_parts = [f"<p>{html.escape(p)}</p>" for p in paragraphs]
+    
+    content = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset='utf-8'/>
+    <link rel='stylesheet' type='text/css' href='style.css'/>
+    <title>{html.escape(chapter_title)}</title>
+</head>
+<body>
+    <h1 class='chapter-title'>{html.escape(chapter_title)}</h1>
+    <div class='chapter-content'>
+        {chr(10).join(body_parts)}
+    </div>
+</body>
+</html>"""
+    
+    chapter = epub.EpubHtml(
+        title=chapter_title[:255],
+        file_name=f"chapter_{chapter_num:03d}.xhtml",
+        lang="en",
+    )
+    chapter.content = content
+    chapter.add_item(css)
+    
+    return chapter
+
+
 def write_document(
     path: Path,
-    text: str,
+    text: str = "",
     title: str = "Translation",
+    chapters: list[tuple[str, str]] | None = None
 ) -> None:
     """
     Write text to a file in the given format.
@@ -191,6 +296,12 @@ def write_document(
     - .txt  – plain text (UTF-8)
     - .pdf  – PDF (requires fpdf2 + Unicode font)
     - .epub – EPUB (requires ebooklib)
+    
+    Args:
+        path: Output file path
+        text: Content (used for single-content mode or if chapters not provided)
+        title: Document title
+        chapters: Optional list of (chapter_title, chapter_content) tuples for multi-chapter EPUB
 
     Raises ValidationError if the format is unsupported.
     """
@@ -202,8 +313,18 @@ def write_document(
         )
 
     if suffix == ".txt":
+        if chapters:
+            parts = []
+            for ch_title, ch_content in chapters:
+                parts.append(f"{'=' * 60}\n{ch_title}\n{'=' * 60}\n\n{ch_content}")
+            text = "\n\n\n".join(parts)
         _write_txt(path, text)
     elif suffix == ".pdf":
+        if chapters:
+            parts = []
+            for ch_title, ch_content in chapters:
+                parts.append(f"{ch_title}\n\n{ch_content}")
+            text = "\n\n\n".join(parts)
         _write_pdf(path, text, title=title)
     elif suffix == ".epub":
-        _write_epub(path, text, title=title)
+        _write_epub(path, text, title=title, chapters=chapters)
