@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from lexiconweaver.config import Config
-from lexiconweaver.database.models import BurstTerm, GlossaryTerm, IgnoredTerm, Project
+from lexiconweaver.database.models import BurstTerm, GlossaryTerm, IgnoredTerm, Project, ProposedTerm
 from lexiconweaver.engines.base import BaseEngine
 from lexiconweaver.logging_config import get_logger
 from lexiconweaver.providers import LLMProviderManager
@@ -82,6 +82,7 @@ class GlobalScout(BaseEngine):
         
         existing_terms = self._get_existing_terms()
         ignored_terms = self._get_ignored_terms()
+        existing_proposals = self._get_existing_proposals()
         
         if progress_callback:
             progress_callback("Extracting n-grams...")
@@ -111,7 +112,7 @@ class GlobalScout(BaseEngine):
         for burst_term in burst_terms:
             term_lower = burst_term.term.lower()
             
-            if term_lower in existing_terms or term_lower in ignored_terms:
+            if term_lower in existing_terms or term_lower in ignored_terms or term_lower in existing_proposals:
                 continue
             
             if term_lower in capitalized_terms:
@@ -282,6 +283,11 @@ class GlobalScout(BaseEngine):
         terms = IgnoredTerm.select().where(IgnoredTerm.project == self.project)
         return {term.term.lower() for term in terms}
     
+    def _get_existing_proposals(self) -> set[str]:
+        """Get set of existing proposed terms (lowercase) for this project."""
+        proposals = ProposedTerm.select().where(ProposedTerm.project == self.project)
+        return {prop.source_term.lower() for prop in proposals}
+    
     async def refine_with_llm(
         self,
         candidates: list[BurstTermCandidate],
@@ -410,6 +416,49 @@ class GlobalScout(BaseEngine):
                 })
         
         return refined
+    
+    def save_refined_terms_as_proposals(self, refined_terms: list[dict]) -> int:
+        """
+        Save LLM-refined terms as ProposedTerms for user review.
+        
+        Args:
+            refined_terms: List of dictionaries with term, translation, category, reasoning
+            
+        Returns:
+            Number of proposals saved
+        """
+        saved_count = 0
+        
+        for term_data in refined_terms:
+            try:
+                existing = ProposedTerm.get_or_none(
+                    ProposedTerm.project == self.project,
+                    ProposedTerm.source_term == term_data["term"]
+                )
+                
+                if existing:
+                    existing.proposed_translation = term_data["translation"]
+                    existing.proposed_category = term_data["category"]
+                    existing.llm_reasoning = term_data["reasoning"]
+                    existing.status = "pending"
+                    existing.save()
+                    saved_count += 1
+                else:
+                    ProposedTerm.create(
+                        project=self.project,
+                        source_term=term_data["term"],
+                        proposed_translation=term_data["translation"],
+                        proposed_category=term_data["category"],
+                        llm_reasoning=term_data["reasoning"],
+                        status="pending"
+                    )
+                    saved_count += 1
+            except Exception as e:
+                logger.warning(f"Failed to save proposal for '{term_data['term']}': {e}")
+                continue
+        
+        logger.info(f"Saved {saved_count} term proposals for review")
+        return saved_count
     
     def save_burst_terms_to_db(self, candidates: list[BurstTermCandidate]) -> int:
         """

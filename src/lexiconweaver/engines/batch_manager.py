@@ -67,7 +67,8 @@ class BatchManager:
         self,
         mode: Literal["full", "scout_only", "translate_only"] = "full",
         resume: bool = True,
-        progress_callback: Callable[[BatchProgress], None] | None = None
+        progress_callback: Callable[[BatchProgress], None] | None = None,
+        auto_approve_terms: bool = False
     ) -> dict:
         """
         Process all chapters in input folder.
@@ -100,6 +101,46 @@ class BatchManager:
             scout_results = await self.run_global_scout(chapters, progress_callback)
             results["chapters_scouted"] = scout_results["chapters_analyzed"]
             results["terms_discovered"] = scout_results["terms_found"]
+            results["proposals_saved"] = scout_results.get("proposals_saved", 0)
+            
+            if mode == "scout_only":
+                logger.info("Scout complete, stopping for user review")
+                return results
+            
+            if mode == "full" and auto_approve_terms and results.get("proposals_saved", 0) > 0:
+                from lexiconweaver.database.models import ProposedTerm, GlossaryTerm
+                
+                pending = ProposedTerm.select().where(
+                    ProposedTerm.project == self.project,
+                    ProposedTerm.status == "pending"
+                )
+                
+                approved_count = 0
+                for proposal in pending:
+                    try:
+                        existing = GlossaryTerm.get_or_none(
+                            GlossaryTerm.project == self.project,
+                            GlossaryTerm.source_term == proposal.source_term
+                        )
+                        
+                        if not existing:
+                            GlossaryTerm.create(
+                                project=self.project,
+                                source_term=proposal.source_term,
+                                target_term=proposal.proposed_translation,
+                                category=proposal.proposed_category or "General",
+                                notes=f"Auto-approved from scout: {proposal.llm_reasoning}"
+                            )
+                        
+                        proposal.status = "approved"
+                        proposal.save()
+                        approved_count += 1
+                    except Exception as e:
+                        logger.warning(f"Failed to auto-approve '{proposal.source_term}': {e}")
+                        continue
+                
+                logger.info(f"Auto-approved {approved_count} terms before translation")
+                results["auto_approved"] = approved_count
         
         if mode in ["full", "translate_only"]:
             translate_results = await self.translate_all_chapters(
@@ -187,13 +228,22 @@ class BatchManager:
             progress_callback=scout_progress
         )
         
-        saved_count = self.global_scout.save_burst_terms_to_db(candidates[:len(refined_terms)])
+        burst_saved = self.global_scout.save_burst_terms_to_db(candidates[:len(refined_terms)])
+        
+        proposals_saved = self.global_scout.save_refined_terms_as_proposals(refined_terms)
+        
+        logger.info(
+            "Global scout completed",
+            burst_terms=burst_saved,
+            proposals=proposals_saved
+        )
         
         return {
             "chapters_analyzed": len(chapters),
             "candidates_found": len(candidates),
             "terms_refined": len(refined_terms),
-            "terms_found": saved_count
+            "terms_found": burst_saved,
+            "proposals_saved": proposals_saved
         }
     
     async def translate_all_chapters(

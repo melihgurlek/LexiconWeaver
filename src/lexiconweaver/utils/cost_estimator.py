@@ -103,7 +103,7 @@ def calculate_dry_run_summary(
     cost_min = total_cost * 0.8
     cost_max = total_cost * 1.2
     
-    avg_time_per_chapter = 0.6
+    avg_time_per_chapter = 2.5
     est_time = (len(chapters) * avg_time_per_chapter) / max_parallel
     
     logger.info(

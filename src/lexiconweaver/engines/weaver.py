@@ -301,8 +301,19 @@ class Weaver(BaseEngine):
                     context_length = min(200, len(translation))
                     previous_context = translation[-context_length:] if translation else ""
         
-        if not title:
-            title = f"Chapter {chapter_num}"
+        if not title or not title.strip():
+            if source_filename:
+                from pathlib import Path
+                stem = Path(source_filename).stem
+                title = stem.replace("_", " ").replace("-", " ").strip()
+                if not title:
+                    title = f"Chapter {chapter_num}"
+            else:
+                title = f"Chapter {chapter_num}"
+            
+            logger.info(f"Using fallback title for chapter {chapter_num}: {title}")
+        elif not title.startswith(f"Chapter {chapter_num}"):
+            title = f"Chapter {chapter_num}: {title}"
         
         content = "\n\n".join(translated_batches)
         
@@ -448,12 +459,14 @@ class Weaver(BaseEngine):
             logger.warning("No TITLE/--- separator found, treating as plain translation")
             translation_lines = lines
         
-        if not title:
-            title = f"Chapter {chapter_num}"
-            logger.info(f"No title found, using fallback: {title}")
+        if title and title.strip():
+            full_title = f"Chapter {chapter_num}: {title}"
+        else:
+            full_title = f"Chapter {chapter_num}"
+            logger.info(f"No title found, using fallback: {full_title}")
         
         translation = '\n'.join(translation_lines).strip()
-        return title, translation
+        return full_title, translation
     
     async def translate_chapters_parallel(
         self,
@@ -582,11 +595,19 @@ class Weaver(BaseEngine):
                 missing_terms.append(source_term)
 
         if missing_terms:
-            logger.warning(
-                "Translation verification failed",
-                missing_terms=missing_terms,
-                source_hash=generate_hash(source)[:8],
-            )
+            if len(missing_terms) > 2:
+                logger.warning(
+                    "Translation verification: multiple terms not found",
+                    missing_terms=missing_terms[:5],  # Show max 5
+                    count=len(missing_terms),
+                    source_hash=generate_hash(source)[:8],
+                )
+            else:
+                logger.debug(
+                    "Translation verification: minor term variations",
+                    missing_terms=missing_terms,
+                    source_hash=generate_hash(source)[:8],
+                )
 
     def _get_from_cache(self, paragraph: str) -> str | None:
         """Get translation from cache if available."""

@@ -665,6 +665,8 @@ def batch_translate(
     dry_run: bool = typer.Option(False, "--dry-run", help="Calculate costs without translating"),
     resume: bool = typer.Option(True, "--resume/--no-resume", help="Skip already-translated chapters"),
     mode: str = typer.Option("full", "--mode", help="Mode: full, scout_only, or translate_only"),
+    review_terms: bool = typer.Option(False, "--review-terms", help="Pause after scouting to review terms (full mode only)"),
+    auto_approve: bool = typer.Option(False, "--auto-approve", help="Automatically approve all scouted terms without prompting"),
 ):
     """
     Batch translate multiple chapters with parallel processing.
@@ -720,29 +722,50 @@ def batch_translate(
                 raise typer.Exit(0)
             console.print()
         
-        current_stage = {"stage": "", "current": 0, "total": 0}
+        current_stage = {"stage": "", "task_id": None}
+        main_progress = Progress(console=console, transient=False)
+        main_progress.start()
         
         def progress_callback(progress: BatchProgress):
             if progress.stage != current_stage["stage"]:
-                if current_stage["stage"]:
-                    console.print()  # New line between stages
+                if current_stage["task_id"] is not None:
+                    main_progress.update(current_stage["task_id"], completed=progress.total)
+                
                 current_stage["stage"] = progress.stage
-                console.print(f"[bold blue]{progress.stage.upper()} STAGE[/bold blue]")
-            
-            current_stage["current"] = progress.current
-            current_stage["total"] = progress.total
-            console.print(f"  [{progress.current}/{progress.total}] {progress.message}")
+                console.print(f"\n[bold blue]━━━ {progress.stage.upper()} STAGE ━━━[/bold blue]")
+                
+                task_id = main_progress.add_task(
+                    f"[cyan]{progress.message}",
+                    total=progress.total
+                )
+                current_stage["task_id"] = task_id
+            else:
+                if current_stage["task_id"] is not None:
+                    main_progress.update(
+                        current_stage["task_id"],
+                        completed=progress.current,
+                        description=f"[cyan]{progress.message}"
+                    )
         
         console.print("[bold green]Starting Batch Processing...[/bold green]\n")
+        
+        if review_terms and mode == "full":
+            console.print("[cyan]Review mode enabled: Running scout_only, then you can review terms[/cyan]\n")
+            mode = "scout_only"
+        
+        if auto_approve and mode == "full":
+            console.print("[yellow]⚡ Auto-approve enabled: All scouted terms will be automatically approved[/yellow]\n")
         
         results = asyncio.run(
             batch_manager.process_folder(
                 mode=mode,
                 resume=resume,
-                progress_callback=progress_callback
+                progress_callback=progress_callback,
+                auto_approve_terms=auto_approve
             )
         )
         
+        main_progress.stop()
         console.print("\n[bold green]✓ Batch Processing Complete![/bold green]\n")
         
         results_table = Table(title="Results Summary")
@@ -753,6 +776,8 @@ def batch_translate(
         if mode in ["full", "scout_only"]:
             results_table.add_row("Chapters Scouted", str(results["chapters_scouted"]))
             results_table.add_row("Terms Discovered", str(results["terms_discovered"]))
+            if results.get("proposals_saved", 0) > 0:
+                results_table.add_row("Proposals for Review", str(results["proposals_saved"]))
         if mode in ["full", "translate_only"]:
             results_table.add_row("Chapters Translated", str(results["chapters_translated"]))
             if results.get("chapters_skipped", 0) > 0:
@@ -763,7 +788,26 @@ def batch_translate(
         console.print(results_table)
         
         if mode == "scout_only":
-            console.print("\n[yellow]Note:[/yellow] Scout complete. Review and approve terms, then run with --mode translate_only")
+            console.print("\n[yellow]⚠️  Next Steps:[/yellow]")
+            console.print("   1. Review proposed terms: [cyan]lexiconweaver approve-terms --project \"" + project_name + "\"[/cyan]")
+            console.print("   2. Then translate: [cyan]lexiconweaver batch-translate " + str(workspace) + " --project \"" + project_name + "\" --mode translate_only[/cyan]")
+        
+        # Show auto-approve status if it happened
+        if auto_approve and results.get("auto_approved", 0) > 0:
+            console.print(f"\n[green]✓[/green] Auto-approved {results['auto_approved']} terms (used in translation)")
+        
+        # Warn about pending terms if not auto-approved
+        if mode == "full" and results.get("proposals_saved", 0) > 0 and not auto_approve:
+            pending_count = ProposedTerm.select().where(
+                ProposedTerm.project == project,
+                ProposedTerm.status == "pending"
+            ).count()
+            
+            if pending_count > 0:
+                console.print(f"\n[yellow]⚠️  {pending_count} terms are pending review![/yellow]")
+                console.print("   Translations used existing glossary only.")
+                console.print("   To review and approve new terms:")
+                console.print(f"   [cyan]lexiconweaver approve-terms --project \"{project_name}\" --interactive[/cyan]")
         
     except LexiconWeaverError as e:
         console.print(f"\n[red]Error: {e.message}[/red]")
